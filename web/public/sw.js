@@ -1,4 +1,4 @@
-const CACHE = "companero-v1";
+const CACHE = "companero-v2";
 const APP_SHELL = [
   "/",
   "/manifest.json",

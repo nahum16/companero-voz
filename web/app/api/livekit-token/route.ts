@@ -1,6 +1,10 @@
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { NextRequest, NextResponse } from "next/server";
-import { AccessToken } from "livekit-server-sdk";
+import {
+  AccessToken,
+  AgentDispatchClient,
+  RoomServiceClient,
+} from "livekit-server-sdk";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -29,6 +33,50 @@ function sanitizeUserName(raw?: unknown): string {
   if (typeof raw !== "string") return "Usuario";
   const cleaned = raw.trim().replace(/\s+/g, " ").slice(0, 32);
   return cleaned || "Usuario";
+}
+
+function toHttpUrl(wsUrl: string): string {
+  if (wsUrl.startsWith("wss://")) return `https://${wsUrl.slice(6)}`;
+  if (wsUrl.startsWith("ws://")) return `http://${wsUrl.slice(5)}`;
+  return wsUrl;
+}
+
+async function ensureRoomReadyForAgent(
+  serverUrl: string,
+  apiKey: string,
+  apiSecret: string,
+  roomName: string,
+): Promise<void> {
+  try {
+    const httpUrl = toHttpUrl(serverUrl);
+    const roomService = new RoomServiceClient(httpUrl, apiKey, apiSecret);
+    const participants = await roomService.listParticipants(roomName);
+    // kind === 4 corresponde a ParticipantInfo_Kind.AGENT en LiveKit protobuf
+    const hasAgent = participants.some(
+      (p) =>
+        (p as unknown as { kind?: number }).kind === 4 ||
+        p.identity.startsWith("agent-"),
+    );
+
+    if (!hasAgent) {
+      if (participants.length === 0) {
+        // Si la sala había quedado vacía sin agente en LiveKit Cloud, eliminarla
+        // para que al entrar el usuario se cree fresca y dispare el auto-dispatch.
+        await roomService.deleteRoom(roomName);
+      } else {
+        // Si ya hay personas dentro pero el agente no está, despachar uno explícitamente.
+        const dispatchClient = new AgentDispatchClient(
+          httpUrl,
+          apiKey,
+          apiSecret,
+        );
+        await dispatchClient.createDispatch(roomName, "");
+      }
+    }
+  } catch {
+    // Si la sala aún no existe (404), LiveKit la creará al conectar el primer participante
+    // y despachará al agente automáticamente.
+  }
 }
 
 export async function POST(request: NextRequest) {
@@ -70,13 +118,13 @@ export async function POST(request: NextRequest) {
   const userName = sanitizeUserName(body?.userName);
   const requestedCode = sanitizeRoomCode(body?.roomName);
   const sharedCode = requestedCode || randomUUID().slice(0, 8);
-  // Si el usuario indica un código de sala compartida (o entra por un enlace ?sala=...),
-  // todos los que usen ese código entran a la misma sala `sala-<codigo>`.
   const roomName = `sala-${sharedCode}`;
   const identity = `usuario-${randomUUID().slice(0, 8)}`;
 
-  // No se configura despacho explícito: el agente Python no define `agent_name`,
-  // por lo que LiveKit Cloud lo despacha automáticamente a toda sala nueva.
+  if (requestedCode) {
+    await ensureRoomReadyForAgent(serverUrl, apiKey, apiSecret, roomName);
+  }
+
   const at = new AccessToken(apiKey, apiSecret, {
     identity,
     name: userName,

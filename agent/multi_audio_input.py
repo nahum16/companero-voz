@@ -3,12 +3,20 @@ import collections
 import logging
 import time
 from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
 
 import numpy as np
 from livekit import rtc
+from livekit.agents import utils
 from livekit.agents.voice import io as voice_io
 
 logger = logging.getLogger("companero.multi_audio")
+
+# Umbral RMS (~-43 dBFS en PCM 16 bits) por encima del cual consideramos que un
+# micrófono tiene voz activa, y ventana de cola (hangover) para no cortar finales de frase
+# ni impedir que Silero VAD detecte el silencio de fin de turno cuando hay 2+ micrófonos abiertos.
+SPEECH_RMS_THRESHOLD = 220.0
+SPEECH_HANGOVER_SEC = 0.65
 
 
 def mix_int16_frames(frames: list[rtc.AudioFrame]) -> rtc.AudioFrame:
@@ -38,6 +46,17 @@ def mix_int16_frames(frames: list[rtc.AudioFrame]) -> rtc.AudioFrame:
     )
 
 
+def make_silence_frame(base: rtc.AudioFrame) -> rtc.AudioFrame:
+    """Genera un frame de silencio con el mismo formato y duración que `base`."""
+    num_samples = base.samples_per_channel * base.num_channels
+    return rtc.AudioFrame(
+        data=bytes(num_samples * 2),
+        sample_rate=base.sample_rate,
+        num_channels=base.num_channels,
+        samples_per_channel=base.samples_per_channel,
+    )
+
+
 def compute_rms_int16(frame: rtc.AudioFrame) -> float:
     """Calcula la energía RMS de un frame PCM de 16 bits."""
     samples = np.frombuffer(frame.data, dtype=np.int16)
@@ -46,11 +65,34 @@ def compute_rms_int16(frame: rtc.AudioFrame) -> float:
     return float(np.sqrt(np.mean(samples.astype(np.float32) ** 2)))
 
 
+@dataclass
+class _TrackState:
+    track_sid: str
+    participant_identity: str
+    display_name: str
+    task: asyncio.Task[None]
+    buffer: collections.deque[rtc.AudioFrame] = field(
+        default_factory=lambda: collections.deque(maxlen=4),
+    )
+    preroll: collections.deque[rtc.AudioFrame] = field(
+        default_factory=lambda: collections.deque(maxlen=3),
+    )
+    last_frame_ts: float = 0.0
+    speaking_until: float = 0.0
+    was_speaking: bool = False
+
+
 class MultiParticipantAudioInput(voice_io.AudioInput):
     """
-    Entrada de audio que escucha y mezcla simultáneamente los micrófonos de todos
-    los participantes humanos conectados a la sala, sin bloquearse cuando alguien
-    silencia su micrófono y rastreando quién es el hablante activo por energía RMS.
+    Entrada de audio multipersona sincronizada por reloj único (50 ms = 20 frames/s).
+
+    - Una pista activa actúa como reloj maestro (con failover automático en 90 ms si se
+      silencia o desconecta), garantizando que AgentSession siempre reciba frames a velocidad
+      exacta 1x sin duplicar ni atrasar el flujo cuando hay 2 o más personas en la sala.
+    - Puerta de voz por participante (voice-gating con pre-roll y hangover de 0.65 s):
+      solo se mezclan las pistas que tienen voz activa, evitando que el ruido de fondo
+      del micrófono abierto de una segunda persona impida a Silero VAD detectar el silencio
+      de fin de turno cuando la primera persona termina de hablar.
     """
 
     def __init__(
@@ -71,11 +113,10 @@ class MultiParticipantAudioInput(voice_io.AudioInput):
         self._closed = False
         self._started = False
 
-        self._track_queues: dict[str, collections.deque[rtc.AudioFrame]] = {}
-        self._track_last_active: dict[str, float] = {}
-        self._track_tasks: dict[str, asyncio.Task[None]] = {}
-        self._frame_event = asyncio.Event()
-        self._last_emit_ts = 0.0
+        self._out_ch = utils.aio.Chan[rtc.AudioFrame]()
+        self._tracks: dict[str, _TrackState] = {}
+        self._primary_sid: str | None = None
+        self._last_primary_ts: float = 0.0
 
         self.last_active_speaker: str | None = None
         self._active_speaker_rms = 0.0
@@ -110,6 +151,9 @@ class MultiParticipantAudioInput(voice_io.AudioInput):
 
     def __aiter__(self) -> AsyncIterator[rtc.AudioFrame]:
         return self
+
+    async def __anext__(self) -> rtc.AudioFrame:
+        return await self._out_ch.__anext__()
 
     def _on_track_subscribed(
         self,
@@ -147,8 +191,13 @@ class MultiParticipantAudioInput(voice_io.AudioInput):
         self,
         participant: rtc.RemoteParticipant,
     ) -> None:
-        for pub in participant.track_publications.values():
-            self._stop_track_stream(pub.sid)
+        sids = [
+            sid
+            for sid, st in self._tracks.items()
+            if st.participant_identity == participant.identity
+        ]
+        for sid in sids:
+            self._stop_track_stream(sid)
 
     def _start_track_stream(
         self,
@@ -156,38 +205,46 @@ class MultiParticipantAudioInput(voice_io.AudioInput):
         participant: rtc.RemoteParticipant,
     ) -> None:
         track_sid = track.sid
-        if track_sid in self._track_tasks:
+        if track_sid in self._tracks:
             return
 
         display_name = (participant.name or "").strip() or participant.identity
-        logger.info(
-            "Escuchando micrófono de %s (%s)",
-            display_name,
-            participant.identity,
-        )
         stream = rtc.AudioStream.from_track(
             track=track,
             sample_rate=self._sample_rate,
             num_channels=self._num_channels,
             frame_size_ms=self._frame_size_ms,
         )
-        self._track_queues[track_sid] = collections.deque(maxlen=6)
         task = asyncio.create_task(
-            self._read_track_loop(track_sid, participant, stream),
+            self._read_track_loop(track_sid, participant.identity, display_name, stream),
         )
-        self._track_tasks[track_sid] = task
+        self._tracks[track_sid] = _TrackState(
+            track_sid=track_sid,
+            participant_identity=participant.identity,
+            display_name=display_name,
+            task=task,
+        )
+        if self._primary_sid is None:
+            self._primary_sid = track_sid
+        logger.info(
+            "Escuchando micrófono de %s (%s) [total micrófonos en sala: %d]",
+            display_name,
+            participant.identity,
+            len(self._tracks),
+        )
 
     def _stop_track_stream(self, track_sid: str) -> None:
-        task = self._track_tasks.pop(track_sid, None)
-        if task is not None:
-            task.cancel()
-        self._track_queues.pop(track_sid, None)
-        self._track_last_active.pop(track_sid, None)
+        state = self._tracks.pop(track_sid, None)
+        if state is not None:
+            state.task.cancel()
+        if self._primary_sid == track_sid:
+            self._primary_sid = next(iter(self._tracks), None)
 
     async def _read_track_loop(
         self,
         track_sid: str,
-        participant: rtc.RemoteParticipant,
+        participant_identity: str,
+        display_name: str,
         stream: rtc.AudioStream,
     ) -> None:
         try:
@@ -197,24 +254,62 @@ class MultiParticipantAudioInput(voice_io.AudioInput):
                 if not self._attached:
                     continue
 
-                frame = event.frame
-                rms = compute_rms_int16(frame)
-                now = time.monotonic()
-                if rms > 350.0 and (
-                    rms >= self._active_speaker_rms * 0.85
-                    or now - self._active_speaker_ts > 1.2
-                ):
-                    self._active_speaker_rms = rms
-                    self._active_speaker_ts = now
-                    self.last_active_speaker = (
-                        (participant.name or "").strip() or participant.identity
-                    )
+                state = self._tracks.get(track_sid)
+                if state is None:
+                    break
 
-                queue = self._track_queues.get(track_sid)
-                if queue is not None:
-                    queue.append(frame)
-                    self._track_last_active[track_sid] = now
-                    self._frame_event.set()
+                frame = event.frame
+                now = time.monotonic()
+                state.last_frame_ts = now
+                rms = compute_rms_int16(frame)
+
+                if rms >= SPEECH_RMS_THRESHOLD:
+                    state.speaking_until = now + SPEECH_HANGOVER_SEC
+                    if rms > 320.0 and (
+                        rms >= self._active_speaker_rms * 0.85
+                        or now - self._active_speaker_ts > 1.0
+                    ):
+                        self._active_speaker_rms = rms
+                        self._active_speaker_ts = now
+                        self.last_active_speaker = display_name
+
+                is_speaking = now <= state.speaking_until
+
+                # Si sólo hay 1 participante en la sala, enviar su frame directamente sin puerta
+                # para que Silero VAD opere exactamente igual que en una sesión 1 a 1.
+                if len(self._tracks) <= 1:
+                    self._primary_sid = track_sid
+                    self._last_primary_ts = now
+                    self._out_ch.send_nowait(frame)
+                    continue
+
+                # Cuando hay 2+ participantes en la sala:
+                # Si la pista acaba de empezar a hablar, volcar primero su pre-roll (100 ms)
+                # para no cortar la primera consonante.
+                if is_speaking:
+                    if not state.was_speaking and state.preroll:
+                        for pre_frame in state.preroll:
+                            state.buffer.append(pre_frame)
+                        state.preroll.clear()
+                    state.buffer.append(frame)
+                else:
+                    state.preroll.append(frame)
+                state.was_speaking = is_speaking
+
+                # Failover automático de reloj si el micrófono primario está silenciado (>90 ms sin paquetes)
+                if (
+                    self._primary_sid is None
+                    or self._primary_sid not in self._tracks
+                    or (
+                        self._primary_sid != track_sid
+                        and now - self._last_primary_ts > 0.09
+                    )
+                ):
+                    self._primary_sid = track_sid
+
+                if self._primary_sid == track_sid:
+                    self._last_primary_ts = now
+                    self._emit_mixed_tick(frame)
         except asyncio.CancelledError:
             pass
         except Exception:
@@ -224,48 +319,29 @@ class MultiParticipantAudioInput(voice_io.AudioInput):
                 await stream.aclose()
             except Exception:
                 pass
-            self._track_queues.pop(track_sid, None)
-            self._track_last_active.pop(track_sid, None)
-            self._track_tasks.pop(track_sid, None)
+            self._tracks.pop(track_sid, None)
+            if self._primary_sid == track_sid:
+                self._primary_sid = next(iter(self._tracks), None)
 
-    async def __anext__(self) -> rtc.AudioFrame:
-        while not self._closed:
-            now = time.monotonic()
-            active_streams = sum(
-                1 for ts in self._track_last_active.values() if now - ts < 0.15
-            )
-            # Cuando 2 o más micrófonos están abiertos enviando paquetes al mismo tiempo,
-            # acompasar la ventana a ~46 ms para mezclar un frame por participante
-            # y mantener la velocidad exacta 1x de tiempo real.
-            if active_streams > 1 and self._last_emit_ts > 0:
-                target_interval = (self._frame_size_ms / 1000.0) * 0.92
-                remaining = target_interval - (now - self._last_emit_ts)
-                if remaining > 0.002:
-                    await asyncio.sleep(remaining)
+    def _emit_mixed_tick(self, reference_frame: rtc.AudioFrame) -> None:
+        """Emite exactamente un frame de 50 ms combinando a todos los participantes con voz activa."""
+        active_frames: list[rtc.AudioFrame] = []
+        for state in list(self._tracks.values()):
+            if state.buffer:
+                active_frames.append(state.buffer.popleft())
 
-            frames: list[rtc.AudioFrame] = []
-            for queue in list(self._track_queues.values()):
-                if queue:
-                    frames.append(queue.popleft())
+        if not active_frames:
+            # Nadie está hablando en este pulso de 50 ms: emitir silencio limpio para que
+            # Silero VAD detecte el fin de turno sin que el ruido ambiente de otro micrófono lo bloquee.
+            self._out_ch.send_nowait(make_silence_frame(reference_frame))
+            return
 
-            if not frames:
-                self._frame_event.clear()
-                if any(self._track_queues.values()):
-                    self._frame_event.set()
-                    continue
-                await self._frame_event.wait()
-                continue
-
-            self._last_emit_ts = time.monotonic()
-            return mix_int16_frames(frames)
-
-        raise StopAsyncIteration
+        self._out_ch.send_nowait(mix_int16_frames(active_frames))
 
     async def aclose(self) -> None:
         if self._closed:
             return
         self._closed = True
-        self._frame_event.set()
 
         if self._started:
             self._room.off("track_subscribed", self._on_track_subscribed)
@@ -273,11 +349,11 @@ class MultiParticipantAudioInput(voice_io.AudioInput):
             self._room.off("track_unpublished", self._on_track_unpublished)
             self._room.off("participant_disconnected", self._on_participant_disconnected)
 
-        tasks = list(self._track_tasks.values())
-        self._track_tasks.clear()
-        self._track_queues.clear()
-        self._track_last_active.clear()
-        for task in tasks:
-            task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        states = list(self._tracks.values())
+        self._tracks.clear()
+        self._primary_sid = None
+        for st in states:
+            st.task.cancel()
+        if states:
+            await asyncio.gather(*(st.task for st in states), return_exceptions=True)
+        self._out_ch.close()

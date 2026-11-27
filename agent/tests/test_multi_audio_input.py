@@ -1,7 +1,7 @@
 import numpy as np
 from livekit import rtc
 
-from multi_audio_input import compute_rms_int16, mix_int16_frames
+from multi_audio_input import compute_rms_int16, make_silence_frame, mix_int16_frames
 
 
 def _make_frame(samples: list[int], sample_rate: int = 24000) -> rtc.AudioFrame:
@@ -33,3 +33,12 @@ def test_compute_rms_int16_detecta_energia_de_voz():
     loud = _make_frame([4000, -4000, 4000, -4000])
     assert compute_rms_int16(silent) == 0.0
     assert compute_rms_int16(loud) == 4000.0
+
+
+def test_make_silence_frame_conserva_formato():
+    base = _make_frame([1200, -1200, 800, -800])
+    silence = make_silence_frame(base)
+    assert silence.sample_rate == base.sample_rate
+    assert silence.num_channels == base.num_channels
+    assert silence.samples_per_channel == base.samples_per_channel
+    assert compute_rms_int16(silence) == 0.0

@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import re
 from collections.abc import AsyncIterable
 from typing import Any
 
@@ -13,6 +14,7 @@ from livekit.agents import (
     JobContext,
     JobProcess,
     ModelSettings,
+    StopResponse,
     cli,
     llm,
     room_io,
@@ -30,6 +32,18 @@ load_dotenv()
 
 logger = logging.getLogger("companero")
 MAX_TURNS = 12
+
+# Frases típicas de alucinación de Whisper ante ruido de fondo o silencios
+_WHISPER_HALLUCINATION_RE = re.compile(
+    r"^\s*(?:"
+    r"gracias por ver(?: el video)?\.?|"
+    r"subt[ií]tulos realizados por.*|"
+    r"subt[ií]tulos por.*|"
+    r"suscr[ií]bete(?: al canal)?\.?|"
+    r"m[uú]sica\.?"
+    r")\s*$",
+    re.IGNORECASE,
+)
 
 
 def _human_participants(room: rtc.Room) -> list[rtc.RemoteParticipant]:
@@ -53,6 +67,16 @@ class Companion(Agent):
         self._room = room
         self._multi_input = multi_input
         self._turn_speakers: dict[str, str] = {}
+
+    async def on_user_turn_completed(
+        self,
+        turn_ctx: llm.ChatContext,
+        new_message: llm.ChatMessage,
+    ) -> None:
+        text = (new_message.text_content or "").strip()
+        if not text or _WHISPER_HALLUCINATION_RE.match(text):
+            logger.info("Ignorando alucinación de ruido de Whisper: %r", text)
+            raise StopResponse()
 
     async def llm_node(
         self,
@@ -163,29 +187,38 @@ async def entrypoint(ctx: JobContext) -> None:
                 "min_delay": 0.5,
                 "max_delay": 3.0,
             },
+            # Desactivar `resume_false_interruption` evita que `_ParticipantAudioOutput`
+            # quede en estado `paused` permanente cuando ocurren interrupciones seguidas
+            # en salas con dos o más personas.
             "interruption": {
                 "enabled": True,
                 "mode": "vad",
-                "min_duration": 0.6,
-                "resume_false_interruption": True,
-                "false_interruption_timeout": 1.5,
+                "min_duration": 0.75,
+                "resume_false_interruption": False,
+                "false_interruption_timeout": None,
             },
         },
         tts_text_transforms=["filter_markdown", "filter_emoji"],
     )
 
-    # Usar nuestro mezclador multipersona como entrada de audio y mantener la sesión viva
-    # aunque un participante salga mientras queden otras personas en la sala.
     session.input.audio = multi_input
 
     empty_room_task: asyncio.Task[None] | None = None
 
     async def _close_if_still_empty() -> None:
-        await asyncio.sleep(5.0)
+        # Margen de 15 s por si alguien sale un momento a compartir el enlace y vuelve
+        await asyncio.sleep(15.0)
         if not _human_participants(ctx.room):
-            logger.info("Sala %s sin participantes humanos; cerrando sesión.", ctx.room.name)
+            logger.info(
+                "Sala %s sin participantes humanos tras 15s; eliminando sala y cerrando sesión.",
+                ctx.room.name,
+            )
             await multi_input.aclose()
             await session.aclose()
+            try:
+                await ctx.delete_room(room_name=ctx.room.name)
+            except Exception:
+                logger.debug("No se pudo eliminar la sala al cerrar", exc_info=True)
             ctx.shutdown(reason="Sala vacía")
 
     def _on_participant_connected(participant: rtc.RemoteParticipant) -> None:
@@ -195,10 +228,20 @@ async def entrypoint(ctx: JobContext) -> None:
         if empty_room_task is not None:
             empty_room_task.cancel()
             empty_room_task = None
+        humans = [f"{p.name or p.identity} ({p.identity})" for p in _human_participants(ctx.room)]
+        logger.info("Participante entró a %s. Humanos en sala (%d): %s", ctx.room.name, len(humans), humans)
 
-    def _on_participant_disconnected(_participant: rtc.RemoteParticipant) -> None:
+    def _on_participant_disconnected(participant: rtc.RemoteParticipant) -> None:
         nonlocal empty_room_task
-        if not _human_participants(ctx.room) and empty_room_task is None:
+        humans = [f"{p.name or p.identity} ({p.identity})" for p in _human_participants(ctx.room)]
+        logger.info(
+            "Participante salió de %s (%s). Humanos restantes (%d): %s",
+            ctx.room.name,
+            participant.identity,
+            len(humans),
+            humans,
+        )
+        if not humans and empty_room_task is None:
             empty_room_task = asyncio.create_task(_close_if_still_empty())
 
     ctx.room.on("participant_connected", _on_participant_connected)
