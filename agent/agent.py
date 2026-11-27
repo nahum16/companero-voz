@@ -74,8 +74,8 @@ def build_groq_llm(api_key: str, model_name: str) -> groq.LLM:
     llm_kwargs: dict[str, Any] = {
         "model": model_name,
         "api_key": api_key,
-        "temperature": 0.7,
-        "max_completion_tokens": 220,
+        "temperature": 0.85,
+        "max_completion_tokens": 1200,
     }
     if "qwen" in model_name.lower():
         llm_kwargs["reasoning_effort"] = "none"
