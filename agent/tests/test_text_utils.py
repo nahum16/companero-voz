@@ -1,5 +1,6 @@
 import asyncio
 
+from edge_tts_plugin import parse_sing_utterance
 from text_utils import speech_text_filter
 
 
@@ -46,3 +47,13 @@ def test_quita_marcadores_de_lista_despues_de_salto():
 def test_emite_carry_sin_think_al_final():
     res = asyncio.run(_collect(["¿Todo bien <th"]))
     assert res == "¿Todo bien <th"
+
+
+def test_parse_sing_utterance_detecta_y_limpia_etiqueta():
+    is_sing, txt = parse_sing_utterance("CANTO: Vamos caminando bajo el sol.")
+    assert is_sing is True
+    assert txt == "Vamos caminando bajo el sol."
+
+    is_sing2, txt2 = parse_sing_utterance("Hola, ¿cómo estás?")
+    assert is_sing2 is False
+    assert txt2 == "Hola, ¿cómo estás?"
