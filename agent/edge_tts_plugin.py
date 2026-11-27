@@ -8,10 +8,8 @@ from livekit.agents.types import DEFAULT_API_CONNECT_OPTIONS
 _WORD_RE = re.compile(r"\w", re.UNICODE)
 _SING_TAG_RE = re.compile(r"\bCANTO:\s*")
 
-# Progresión de tonos (pitch) para dar entonación melódica verso a verso en modo canto
-_SING_PITCH_CYCLE = itertools.cycle(
-    ["+14Hz", "+22Hz", "+8Hz", "+18Hz", "+4Hz", "-4Hz"]
-)
+# Variación muy sutil de tono para no distorsionar el vocoder neuronal de Edge TTS
+_SING_PITCH_CYCLE = itertools.cycle(["+0Hz", "+2Hz", "+0Hz", "-2Hz"])
 
 
 def parse_sing_utterance(text: str) -> tuple[bool, str]:
@@ -88,7 +86,7 @@ class EdgeChunkedStream(tts.ChunkedStream):
             output_emitter.flush()
             return
 
-        rate = "-10%" if is_singing else self._edge_tts._rate
+        rate = "+0%" if is_singing else self._edge_tts._rate
         pitch = next(_SING_PITCH_CYCLE) if is_singing else self._edge_tts._pitch
 
         try:
