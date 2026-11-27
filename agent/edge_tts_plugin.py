@@ -1,5 +1,6 @@
 import itertools
 import re
+import unicodedata
 
 import edge_tts
 from livekit.agents import APIConnectionError, APIConnectOptions, tts, utils
@@ -10,6 +11,138 @@ _SING_TAG_RE = re.compile(r"\bCANTO:\s*")
 
 # Variación muy sutil de tono para no distorsionar el vocoder neuronal de Edge TTS
 _SING_PITCH_CYCLE = itertools.cycle(["+0Hz", "+2Hz", "+0Hz", "-2Hz"])
+
+# Catálogo real de voces neuronales en español de edge-tts: (masculina, femenina)
+SPANISH_VOICES: dict[str, tuple[str, str]] = {
+    "argentina": ("es-AR-TomasNeural", "es-AR-ElenaNeural"),
+    "bolivia": ("es-BO-MarceloNeural", "es-BO-SofiaNeural"),
+    "chile": ("es-CL-LorenzoNeural", "es-CL-CatalinaNeural"),
+    "colombia": ("es-CO-GonzaloNeural", "es-CO-SalomeNeural"),
+    "costa rica": ("es-CR-JuanNeural", "es-CR-MariaNeural"),
+    "cuba": ("es-CU-ManuelNeural", "es-CU-BelkysNeural"),
+    "dominicana": ("es-DO-EmilioNeural", "es-DO-RamonaNeural"),
+    "ecuador": ("es-EC-LuisNeural", "es-EC-AndreaNeural"),
+    "el salvador": ("es-SV-RodrigoNeural", "es-SV-LorenaNeural"),
+    "espana": ("es-ES-AlvaroNeural", "es-ES-ElviraNeural"),
+    "estados unidos": ("es-US-AlonsoNeural", "es-US-PalomaNeural"),
+    "guatemala": ("es-GT-AndresNeural", "es-GT-MartaNeural"),
+    "honduras": ("es-HN-CarlosNeural", "es-HN-KarlaNeural"),
+    "mexico": ("es-MX-JorgeNeural", "es-MX-DaliaNeural"),
+    "nicaragua": ("es-NI-FedericoNeural", "es-NI-YolandaNeural"),
+    "panama": ("es-PA-RobertoNeural", "es-PA-MargaritaNeural"),
+    "paraguay": ("es-PY-MarioNeural", "es-PY-TaniaNeural"),
+    "peru": ("es-PE-AlexNeural", "es-PE-CamilaNeural"),
+    "puerto rico": ("es-PR-VictorNeural", "es-PR-KarinaNeural"),
+    "uruguay": ("es-UY-MateoNeural", "es-UY-ValentinaNeural"),
+    "venezuela": ("es-VE-SebastianNeural", "es-VE-PaolaNeural"),
+}
+
+_COUNTRY_ALIASES: dict[str, str] = {
+    "argentin": "argentina",
+    "che": "argentina",
+    "porten": "argentina",
+    "bolivian": "bolivia",
+    "chilen": "chile",
+    "colombian": "colombia",
+    "parc": "colombia",
+    "paisa": "colombia",
+    "costarric": "costa rica",
+    "tico": "costa rica",
+    "tica": "costa rica",
+    "cuban": "cuba",
+    "dominican": "dominicana",
+    "ecuatorian": "ecuador",
+    "salvadoren": "el salvador",
+    "espanol": "espana",
+    "castellan": "espana",
+    "madrid": "espana",
+    "gring": "estados unidos",
+    "eeuu": "estados unidos",
+    "latino": "estados unidos",
+    "guatemal": "guatemala",
+    "honduren": "honduras",
+    "mexic": "mexico",
+    "chilang": "mexico",
+    "nicarag": "nicaragua",
+    "panamen": "panama",
+    "paraguay": "paraguay",
+    "peruan": "peru",
+    "boricua": "puerto rico",
+    "puertorriqu": "puerto rico",
+    "uruguay": "uruguay",
+    "venezolan": "venezuela",
+    "chamo": "venezuela",
+    "caracas": "venezuela",
+}
+
+_ALL_FEMALE_VOICES = {pair[1] for pair in SPANISH_VOICES.values()}
+
+
+def _strip_accents(text: str) -> str:
+    return "".join(
+        ch
+        for ch in unicodedata.normalize("NFD", text.lower())
+        if unicodedata.category(ch) != "Mn"
+    )
+
+
+def resolve_spanish_voice(query: str, current_voice: str = "es-CL-LorenzoNeural") -> tuple[str, str]:
+    """Resuelve un pedido en lenguaje natural (ej. 'argentino', 'mujer colombiana') a una voz real de edge-tts."""
+    norm = _strip_accents(query)
+
+    want_female: bool | None = None
+    if any(w in norm for w in ("mujer", "femenin", "chica", "ella", "nina", "senora")) or re.search(
+        r"\b\w+a\b", norm
+    ) and any(
+        norm.endswith(s)
+        for s in (
+            "mexicana",
+            "argentina",
+            "colombiana",
+            "chilena",
+            "espanola",
+            "venezolana",
+            "peruana",
+            "cubana",
+            "dominicana",
+            "uruguaya",
+            "ecuatoriana",
+            "boliviana",
+            "paraguaya",
+            "panamena",
+        )
+    ):
+        want_female = True
+    elif any(w in norm for w in ("hombre", "masculin", "chico", "varon", "el")):
+        want_female = False
+
+    if want_female is None:
+        want_female = current_voice in _ALL_FEMALE_VOICES
+
+    country: str | None = None
+    for key in SPANISH_VOICES:
+        if key in norm:
+            country = key
+            break
+    if country is None:
+        for alias, target in _COUNTRY_ALIASES.items():
+            if alias in norm:
+                country = target
+                break
+
+    if country is None:
+        # Si sólo pidió cambiar de género (ej. "voz de mujer"), conservar el país actual
+        for key, pair in SPANISH_VOICES.items():
+            if current_voice in pair:
+                country = key
+                break
+        if country is None:
+            country = "chile"
+
+    male_v, female_v = SPANISH_VOICES[country]
+    chosen = female_v if want_female else male_v
+    gender_label = "femenina" if want_female else "masculina"
+    return chosen, f"{country} ({gender_label})"
 
 
 def parse_sing_utterance(text: str) -> tuple[bool, str]:
@@ -40,6 +173,13 @@ class EdgeTTS(tts.TTS):
         self._rate = rate
         self._volume = volume
         self._pitch = pitch
+
+    @property
+    def voice(self) -> str:
+        return self._voice
+
+    def set_voice(self, voice: str) -> None:
+        self._voice = voice
 
     @property
     def model(self) -> str:

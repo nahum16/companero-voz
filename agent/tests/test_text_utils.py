@@ -1,6 +1,6 @@
 import asyncio
 
-from edge_tts_plugin import parse_sing_utterance
+from edge_tts_plugin import parse_sing_utterance, resolve_spanish_voice
 from text_utils import speech_text_filter
 
 
@@ -57,3 +57,17 @@ def test_parse_sing_utterance_detecta_y_limpia_etiqueta():
     is_sing2, txt2 = parse_sing_utterance("Hola, ¿cómo estás?")
     assert is_sing2 is False
     assert txt2 == "Hola, ¿cómo estás?"
+
+
+def test_resolve_spanish_voice_por_pais_y_genero():
+    v1, _ = resolve_spanish_voice("acento argentino", "es-CL-LorenzoNeural")
+    assert v1 == "es-AR-TomasNeural"
+
+    v2, _ = resolve_spanish_voice("habla como mujer colombiana", "es-CL-LorenzoNeural")
+    assert v2 == "es-CO-SalomeNeural"
+
+    v3, _ = resolve_spanish_voice("pon voz de mujer", "es-MX-JorgeNeural")
+    assert v3 == "es-MX-DaliaNeural"
+
+    v4, _ = resolve_spanish_voice("español de españa", "es-MX-DaliaNeural")
+    assert v4 == "es-ES-ElviraNeural"

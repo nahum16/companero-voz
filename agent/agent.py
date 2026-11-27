@@ -17,6 +17,7 @@ from livekit.agents import (
     ModelSettings,
     StopResponse,
     cli,
+    function_tool,
     llm,
     room_io,
     tokenize,
@@ -24,7 +25,7 @@ from livekit.agents import (
 )
 from livekit.plugins import groq, silero
 
-from edge_tts_plugin import EdgeTTS
+from edge_tts_plugin import EdgeTTS, resolve_spanish_voice
 from multi_audio_input import MultiParticipantAudioInput
 from prompts import GREETING, SYSTEM_PROMPT
 from text_utils import speech_text_filter
@@ -98,13 +99,25 @@ class Companion(Agent):
         *,
         room: rtc.Room | None = None,
         multi_input: MultiParticipantAudioInput | None = None,
+        edge_tts_plugin: EdgeTTS | None = None,
         initial_key_idx: int = 0,
     ) -> None:
         super().__init__(instructions=SYSTEM_PROMPT)
         self._room = room
         self._multi_input = multi_input
+        self._edge_tts = edge_tts_plugin
         self._turn_speakers: dict[str, str] = {}
         self._key_idx = initial_key_idx
+
+    @function_tool
+    async def cambiar_acento(self, acento_o_voz: str) -> str:
+        """Cambia el acento o género de la voz del agente en tiempo real (ej. mexicano, argentino, colombiano, español, chileno, venezolano, peruano, cubano, mujer, hombre)."""
+        if self._edge_tts is None:
+            return "No fue posible cambiar la voz en este momento."
+        new_voice, label = resolve_spanish_voice(acento_o_voz, self._edge_tts.voice)
+        self._edge_tts.set_voice(new_voice)
+        logger.info("Voz cambiada en vivo a %s (%s)", new_voice, label)
+        return f"Voz cambiada a {label} ({new_voice}). Responde ya usando este acento."
 
     async def on_user_turn_completed(
         self,
@@ -249,6 +262,7 @@ async def entrypoint(ctx: JobContext) -> None:
 
     multi_input = MultiParticipantAudioInput(ctx.room)
     multi_input.start()
+    edge_tts_plugin = EdgeTTS(voice=edge_voice, rate=edge_rate)
 
     session = AgentSession(
         vad=ctx.proc.userdata["vad"],
@@ -260,7 +274,7 @@ async def entrypoint(ctx: JobContext) -> None:
         ),
         llm=build_groq_llm(active_key, model_name),
         tts=tts.StreamAdapter(
-            tts=EdgeTTS(voice=edge_voice, rate=edge_rate),
+            tts=edge_tts_plugin,
             sentence_tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=12),
         ),
         turn_handling={
@@ -331,6 +345,7 @@ async def entrypoint(ctx: JobContext) -> None:
         agent=Companion(
             room=ctx.room,
             multi_input=multi_input,
+            edge_tts_plugin=edge_tts_plugin,
             initial_key_idx=key_idx,
         ),
         room=ctx.room,
