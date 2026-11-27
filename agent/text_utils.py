@@ -13,14 +13,17 @@ _EMOJI_RE = re.compile(
     "]+",
 )
 _LIST_BREAK_RE = re.compile(r"\n\s*(?:\d+[.)]|[-•])\s+")
+_PERCENT_RE = re.compile(r"(\d)\s*%")
 
 _OPEN_TAG = "<think>"
 _CLOSE_TAG = "</think>"
 
 
 def clean_chunk(text: str) -> str:
-    """Limpia sintaxis visual (Markdown, URLs, emojis, saltos de lista) sin perder espacios entre tokens."""
+    """Limpia sintaxis visual (Markdown, URLs, emojis, saltos de lista) preservando puntuación expresiva (...)."""
     cleaned = _URL_RE.sub("el enlace", text)
+    cleaned = cleaned.replace("…", "...")
+    cleaned = _PERCENT_RE.sub(r"\1 por ciento", cleaned)
     cleaned = _MARKDOWN_RE.sub("", cleaned)
     cleaned = _EMOJI_RE.sub("", cleaned)
     cleaned = _LIST_BREAK_RE.sub(" ", cleaned)

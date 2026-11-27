@@ -225,7 +225,7 @@ class Companion(Agent):
 def prewarm(proc: JobProcess) -> None:
     proc.userdata["vad"] = silero.VAD.load(
         min_speech_duration=0.12,
-        min_silence_duration=float(os.getenv("VAD_MIN_SILENCE", "0.55")),
+        min_silence_duration=float(os.getenv("VAD_MIN_SILENCE", "0.50")),
         prefix_padding_duration=0.3,
         activation_threshold=float(os.getenv("VAD_ACTIVATION_THRESHOLD", "0.5")),
         sample_rate=16000,
@@ -255,7 +255,7 @@ async def entrypoint(ctx: JobContext) -> None:
 
     model_name = os.getenv("GROQ_LLM_MODEL", "qwen/qwen3.8-27b")
     edge_voice = os.getenv("EDGE_TTS_VOICE", "es-CL-LorenzoNeural")
-    edge_rate = os.getenv("EDGE_TTS_RATE", "+5%")
+    edge_rate = os.getenv("EDGE_TTS_RATE", "+0%")
 
     multi_input = MultiParticipantAudioInput(ctx.room)
     multi_input.start()
@@ -270,10 +270,7 @@ async def entrypoint(ctx: JobContext) -> None:
             prompt="Conversación casual en español latinoamericano.",
         ),
         llm=build_groq_llm(active_key, model_name),
-        tts=tts.StreamAdapter(
-            tts=edge_tts_plugin,
-            sentence_tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=12),
-        ),
+        tts=edge_tts_plugin,
         turn_handling={
             "turn_detection": "vad",
             "preemptive_generation": {
@@ -281,7 +278,7 @@ async def entrypoint(ctx: JobContext) -> None:
             },
             "endpointing": {
                 "mode": "fixed",
-                "min_delay": 0.45,
+                "min_delay": 0.30,
                 "max_delay": 2.5,
             },
             "interruption": {
@@ -292,7 +289,6 @@ async def entrypoint(ctx: JobContext) -> None:
                 "false_interruption_timeout": None,
             },
         },
-        tts_text_transforms=["filter_markdown", "filter_emoji"],
     )
 
     session.input.audio = multi_input

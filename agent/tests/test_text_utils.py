@@ -2,6 +2,7 @@ import asyncio
 
 from edge_tts_plugin import (
     detect_accent_change_request,
+    extract_breath_segment,
     parse_sing_utterance,
     resolve_spanish_voice,
 )
@@ -93,3 +94,17 @@ def test_detect_accent_change_request_solo_dispara_cuando_piden_cambio():
     )
     assert res2 is not None
     assert res2[0] == "es-VE-PaolaNeural"
+
+
+def test_extract_breath_segment_preserva_muletillas_y_puntos_suspensivos():
+    # No debe cortar en "Mmm... " cuando sigue minúscula dentro de la misma frase
+    short_buf = "Mmm... mira, te cuento."
+    assert extract_breath_segment(short_buf, is_first=True) is None
+
+    full_buf = "Mmm... mira, la verdad es que sí me parece una locura total. Y además ayer pasó otra cosa."
+    extracted = extract_breath_segment(full_buf, is_first=True)
+    assert extracted is not None
+    seg, rest = extracted
+    assert seg == "Mmm... mira, la verdad es que sí me parece una locura total."
+    assert rest.startswith("Y además")
+
