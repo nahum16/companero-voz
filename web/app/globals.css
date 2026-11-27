@@ -287,6 +287,99 @@ body {
   min-height: 44px;
 }
 
+.active-rooms-box {
+  width: 100%;
+  max-width: 340px;
+  background-color: var(--surface);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 16px;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.active-rooms-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.live-indicator {
+  width: 8px;
+  height: 8px;
+  border-radius: 9999px;
+  background-color: var(--green);
+  box-shadow: 0 0 8px var(--green);
+}
+
+.active-rooms-empty {
+  font-size: 0.82rem;
+  color: var(--muted-text);
+  line-height: 1.35;
+}
+
+.active-rooms-list {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.active-room-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 9px 11px;
+  border-radius: 12px;
+  background-color: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.07);
+}
+
+.active-room-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.active-room-title {
+  font-size: 0.88rem;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.active-room-people {
+  font-size: 0.78rem;
+  color: var(--muted-text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.join-room-btn {
+  background: linear-gradient(160deg, var(--green), var(--green-dark));
+  color: #ffffff;
+  border: none;
+  border-radius: 9999px;
+  padding: 8px 16px;
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+  flex-shrink: 0;
+  min-height: 36px;
+}
+
+.join-room-btn:active {
+  transform: scale(0.96);
+}
+
 .error-text {
   color: #fca5a5;
   font-size: 0.9rem;

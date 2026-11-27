@@ -51,7 +51,6 @@ async function ensureRoomReadyForAgent(
     const httpUrl = toHttpUrl(serverUrl);
     const roomService = new RoomServiceClient(httpUrl, apiKey, apiSecret);
     const participants = await roomService.listParticipants(roomName);
-    // kind === 4 corresponde a ParticipantInfo_Kind.AGENT en LiveKit protobuf
     const hasAgent = participants.some(
       (p) =>
         (p as unknown as { kind?: number }).kind === 4 ||
@@ -60,11 +59,8 @@ async function ensureRoomReadyForAgent(
 
     if (!hasAgent) {
       if (participants.length === 0) {
-        // Si la sala había quedado vacía sin agente en LiveKit Cloud, eliminarla
-        // para que al entrar el usuario se cree fresca y dispare el auto-dispatch.
         await roomService.deleteRoom(roomName);
       } else {
-        // Si ya hay personas dentro pero el agente no está, despachar uno explícitamente.
         const dispatchClient = new AgentDispatchClient(
           httpUrl,
           apiKey,
@@ -74,13 +70,12 @@ async function ensureRoomReadyForAgent(
       }
     }
   } catch {
-    // Si la sala aún no existe (404), LiveKit la creará al conectar el primer participante
+    // Si la sala no existe aún (404), LiveKit la creará al entrar el usuario
     // y despachará al agente automáticamente.
   }
 }
 
 export async function POST(request: NextRequest) {
-  // Leer variables en tiempo de ejecución para que `next build` no falle sin ellas
   const serverUrl = process.env.LIVEKIT_URL?.trim();
   const apiKey = process.env.LIVEKIT_API_KEY?.trim();
   const apiSecret = process.env.LIVEKIT_API_SECRET?.trim();
@@ -117,13 +112,16 @@ export async function POST(request: NextRequest) {
 
   const userName = sanitizeUserName(body?.userName);
   const requestedCode = sanitizeRoomCode(body?.roomName);
-  const sharedCode = requestedCode || randomUUID().slice(0, 8);
+  const nameSlug =
+    userName !== "Usuario" ? sanitizeRoomCode(userName).slice(0, 16) : "";
+  const defaultCode = nameSlug
+    ? `${nameSlug}-${randomUUID().slice(0, 4)}`
+    : randomUUID().slice(0, 8);
+  const sharedCode = requestedCode || defaultCode;
   const roomName = `sala-${sharedCode}`;
   const identity = `usuario-${randomUUID().slice(0, 8)}`;
 
-  if (requestedCode) {
-    await ensureRoomReadyForAgent(serverUrl, apiKey, apiSecret, roomName);
-  }
+  await ensureRoomReadyForAgent(serverUrl, apiKey, apiSecret, roomName);
 
   const at = new AccessToken(apiKey, apiSecret, {
     identity,

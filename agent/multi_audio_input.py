@@ -1,9 +1,8 @@
 import asyncio
-import collections
 import logging
 import time
 from collections.abc import AsyncIterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 from livekit import rtc
@@ -12,11 +11,9 @@ from livekit.agents.voice import io as voice_io
 
 logger = logging.getLogger("companero.multi_audio")
 
-# Umbral RMS (~-43 dBFS en PCM 16 bits) por encima del cual consideramos que un
-# micrófono tiene voz activa, y ventana de cola (hangover) para no cortar finales de frase
-# ni impedir que Silero VAD detecte el silencio de fin de turno cuando hay 2+ micrófonos abiertos.
-SPEECH_RMS_THRESHOLD = 220.0
-SPEECH_HANGOVER_SEC = 0.65
+# Umbral de energía de voz para cambiar el foco al nuevo hablante o mezclar voces simultáneas
+FOCUS_SWITCH_RMS = 160.0
+OVERLAP_SPEECH_RMS = 260.0
 
 
 def mix_int16_frames(frames: list[rtc.AudioFrame]) -> rtc.AudioFrame:
@@ -71,28 +68,21 @@ class _TrackState:
     participant_identity: str
     display_name: str
     task: asyncio.Task[None]
-    buffer: collections.deque[rtc.AudioFrame] = field(
-        default_factory=lambda: collections.deque(maxlen=4),
-    )
-    preroll: collections.deque[rtc.AudioFrame] = field(
-        default_factory=lambda: collections.deque(maxlen=3),
-    )
+    latest_frame: rtc.AudioFrame | None = None
     last_frame_ts: float = 0.0
-    speaking_until: float = 0.0
-    was_speaking: bool = False
+    last_rms: float = 0.0
+    last_voice_ts: float = 0.0
 
 
 class MultiParticipantAudioInput(voice_io.AudioInput):
     """
-    Entrada de audio multipersona sincronizada por reloj único (50 ms = 20 frames/s).
+    Selector de hablante activo y mezclador multipersona sin retardo de cola.
 
-    - Una pista activa actúa como reloj maestro (con failover automático en 90 ms si se
-      silencia o desconecta), garantizando que AgentSession siempre reciba frames a velocidad
-      exacta 1x sin duplicar ni atrasar el flujo cuando hay 2 o más personas en la sala.
-    - Puerta de voz por participante (voice-gating con pre-roll y hangover de 0.65 s):
-      solo se mezclan las pistas que tienen voz activa, evitando que el ruido de fondo
-      del micrófono abierto de una segunda persona impida a Silero VAD detectar el silencio
-      de fin de turno cuando la primera persona termina de hablar.
+    - Mantiene el foco en el participante que está hablando (o que habló por última vez)
+      y reenvía sus frames originales de WebRTC sin recortar consonantes suaves ni alterar
+      el piso natural de audio que espera Silero VAD.
+    - En cuanto otra persona en la sala empieza a hablar con mayor energía RMS, conmuta
+      instantáneamente el foco hacia su micrófono (o mezcla ambos si hablan a la vez).
     """
 
     def __init__(
@@ -115,12 +105,9 @@ class MultiParticipantAudioInput(voice_io.AudioInput):
 
         self._out_ch = utils.aio.Chan[rtc.AudioFrame]()
         self._tracks: dict[str, _TrackState] = {}
-        self._primary_sid: str | None = None
-        self._last_primary_ts: float = 0.0
+        self._focused_sid: str | None = None
 
         self.last_active_speaker: str | None = None
-        self._active_speaker_rms = 0.0
-        self._active_speaker_ts = 0.0
 
     def start(self) -> None:
         if self._started:
@@ -224,8 +211,9 @@ class MultiParticipantAudioInput(voice_io.AudioInput):
             display_name=display_name,
             task=task,
         )
-        if self._primary_sid is None:
-            self._primary_sid = track_sid
+        if self._focused_sid is None:
+            self._focused_sid = track_sid
+            self.last_active_speaker = display_name
         logger.info(
             "Escuchando micrófono de %s (%s) [total micrófonos en sala: %d]",
             display_name,
@@ -237,8 +225,8 @@ class MultiParticipantAudioInput(voice_io.AudioInput):
         state = self._tracks.pop(track_sid, None)
         if state is not None:
             state.task.cancel()
-        if self._primary_sid == track_sid:
-            self._primary_sid = next(iter(self._tracks), None)
+        if self._focused_sid == track_sid:
+            self._focused_sid = next(iter(self._tracks), None)
 
     async def _read_track_loop(
         self,
@@ -260,56 +248,48 @@ class MultiParticipantAudioInput(voice_io.AudioInput):
 
                 frame = event.frame
                 now = time.monotonic()
-                state.last_frame_ts = now
                 rms = compute_rms_int16(frame)
+                state.latest_frame = frame
+                state.last_frame_ts = now
+                state.last_rms = rms
 
-                if rms >= SPEECH_RMS_THRESHOLD:
-                    state.speaking_until = now + SPEECH_HANGOVER_SEC
-                    if rms > 320.0 and (
-                        rms >= self._active_speaker_rms * 0.85
-                        or now - self._active_speaker_ts > 1.0
-                    ):
-                        self._active_speaker_rms = rms
-                        self._active_speaker_ts = now
-                        self.last_active_speaker = display_name
+                if rms >= FOCUS_SWITCH_RMS:
+                    state.last_voice_ts = now
 
-                is_speaking = now <= state.speaking_until
+                focused = self._tracks.get(self._focused_sid or "")
 
-                # Si sólo hay 1 participante en la sala, enviar su frame directamente sin puerta
-                # para que Silero VAD opere exactamente igual que en una sesión 1 a 1.
-                if len(self._tracks) <= 1:
-                    self._primary_sid = track_sid
-                    self._last_primary_ts = now
-                    self._out_ch.send_nowait(frame)
-                    continue
-
-                # Cuando hay 2+ participantes en la sala:
-                # Si la pista acaba de empezar a hablar, volcar primero su pre-roll (100 ms)
-                # para no cortar la primera consonante.
-                if is_speaking:
-                    if not state.was_speaking and state.preroll:
-                        for pre_frame in state.preroll:
-                            state.buffer.append(pre_frame)
-                        state.preroll.clear()
-                    state.buffer.append(frame)
-                else:
-                    state.preroll.append(frame)
-                state.was_speaking = is_speaking
-
-                # Failover automático de reloj si el micrófono primario está silenciado (>90 ms sin paquetes)
+                # Cambiar el foco a esta pista si:
+                # 1. No hay pista enfocada o la pista enfocada lleva >90 ms sin enviar frames (muteada)
+                # 2. Esta pista tiene voz activa y supera claramente la energía actual de la pista enfocada
                 if (
-                    self._primary_sid is None
-                    or self._primary_sid not in self._tracks
+                    focused is None
+                    or (focused.track_sid != track_sid and now - focused.last_frame_ts > 0.09)
                     or (
-                        self._primary_sid != track_sid
-                        and now - self._last_primary_ts > 0.09
+                        focused.track_sid != track_sid
+                        and rms >= FOCUS_SWITCH_RMS
+                        and rms > focused.last_rms * 1.25
+                        and (now - focused.last_voice_ts > 0.35 or rms > focused.last_rms * 1.8)
                     )
                 ):
-                    self._primary_sid = track_sid
+                    self._focused_sid = track_sid
+                    focused = state
 
-                if self._primary_sid == track_sid:
-                    self._last_primary_ts = now
-                    self._emit_mixed_tick(frame)
+                if rms >= FOCUS_SWITCH_RMS and self._focused_sid == track_sid:
+                    self.last_active_speaker = display_name
+
+                # Sólo la pista que tiene el foco marca el reloj de salida de 50 ms (20 frames/s)
+                if self._focused_sid == track_sid:
+                    to_mix = [frame]
+                    for other_sid, other in list(self._tracks.items()):
+                        if (
+                            other_sid != track_sid
+                            and other.latest_frame is not None
+                            and now - other.last_frame_ts < 0.09
+                            and other.last_rms >= OVERLAP_SPEECH_RMS
+                        ):
+                            to_mix.append(other.latest_frame)
+                            other.latest_frame = None
+                    self._out_ch.send_nowait(mix_int16_frames(to_mix))
         except asyncio.CancelledError:
             pass
         except Exception:
@@ -320,23 +300,8 @@ class MultiParticipantAudioInput(voice_io.AudioInput):
             except Exception:
                 pass
             self._tracks.pop(track_sid, None)
-            if self._primary_sid == track_sid:
-                self._primary_sid = next(iter(self._tracks), None)
-
-    def _emit_mixed_tick(self, reference_frame: rtc.AudioFrame) -> None:
-        """Emite exactamente un frame de 50 ms combinando a todos los participantes con voz activa."""
-        active_frames: list[rtc.AudioFrame] = []
-        for state in list(self._tracks.values()):
-            if state.buffer:
-                active_frames.append(state.buffer.popleft())
-
-        if not active_frames:
-            # Nadie está hablando en este pulso de 50 ms: emitir silencio limpio para que
-            # Silero VAD detecte el fin de turno sin que el ruido ambiente de otro micrófono lo bloquee.
-            self._out_ch.send_nowait(make_silence_frame(reference_frame))
-            return
-
-        self._out_ch.send_nowait(mix_int16_frames(active_frames))
+            if self._focused_sid == track_sid:
+                self._focused_sid = next(iter(self._tracks), None)
 
     async def aclose(self) -> None:
         if self._closed:
@@ -351,7 +316,7 @@ class MultiParticipantAudioInput(voice_io.AudioInput):
 
         states = list(self._tracks.values())
         self._tracks.clear()
-        self._primary_sid = None
+        self._focused_sid = None
         for st in states:
             st.task.cancel()
         if states:

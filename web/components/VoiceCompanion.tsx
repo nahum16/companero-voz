@@ -26,6 +26,14 @@ type Status =
   | "reconnecting"
   | "error";
 
+interface ActiveRoomInfo {
+  roomName: string;
+  sharedCode: string;
+  participants: string[];
+  participantCount: number;
+  hasAgent: boolean;
+}
+
 const STATUS_LABELS: Record<Status, string> = {
   idle: "Listo para conectar",
   connecting: "Conectando…",
@@ -74,6 +82,7 @@ export function VoiceCompanion() {
   const [activeRoomCode, setActiveRoomCode] = useState<string | null>(null);
   const [participants, setParticipants] = useState<string[]>([]);
   const [copiedLink, setCopiedLink] = useState(false);
+  const [activeRooms, setActiveRooms] = useState<ActiveRoomInfo[]>([]);
 
   const roomRef = useRef<Room | null>(null);
   const mutedRef = useRef(false);
@@ -101,27 +110,55 @@ export function VoiceCompanion() {
     }
   }, []);
 
-  const cleanup = useCallback((playTone = true) => {
-    keepAliveRef.current?.stop();
-    clearMediaSession();
-
-    if (audioContainerRef.current) {
-      audioContainerRef.current.replaceChildren();
-    }
-
-    roomRef.current = null;
-    mutedRef.current = false;
-    setMuted(false);
-    setNeedsAudioTap(false);
-    setActiveRoomCode(null);
-    setParticipants([]);
-    setCopiedLink(false);
-    setStatus("idle");
-
-    if (playTone) {
-      earconsRef.current?.disconnected();
+  const refreshActiveRooms = useCallback(async () => {
+    try {
+      const res = await fetch("/api/livekit-rooms", { cache: "no-store" });
+      if (!res.ok) return;
+      const data = (await res.json()) as { rooms?: ActiveRoomInfo[] };
+      if (Array.isArray(data.rooms)) {
+        setActiveRooms(data.rooms);
+      }
+    } catch {
+      // Silenciar errores de red durante el polling de salas
     }
   }, []);
+
+  useEffect(() => {
+    if (status !== "idle" && status !== "error") return;
+    void refreshActiveRooms();
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === "visible") {
+        void refreshActiveRooms();
+      }
+    }, 3500);
+    return () => window.clearInterval(timer);
+  }, [refreshActiveRooms, status]);
+
+  const cleanup = useCallback(
+    (playTone = true) => {
+      keepAliveRef.current?.stop();
+      clearMediaSession();
+
+      if (audioContainerRef.current) {
+        audioContainerRef.current.replaceChildren();
+      }
+
+      roomRef.current = null;
+      mutedRef.current = false;
+      setMuted(false);
+      setNeedsAudioTap(false);
+      setActiveRoomCode(null);
+      setParticipants([]);
+      setCopiedLink(false);
+      setStatus("idle");
+
+      if (playTone) {
+        earconsRef.current?.disconnected();
+      }
+      void refreshActiveRooms();
+    },
+    [refreshActiveRooms],
+  );
 
   const toggleMute = useCallback(async () => {
     const room = roomRef.current;
@@ -220,158 +257,167 @@ export function VoiceCompanion() {
     [],
   );
 
-  const connect = useCallback(async () => {
-    if (roomRef.current || status === "connecting") return;
+  const connect = useCallback(
+    async (overrideRoomCode?: string) => {
+      if (roomRef.current || status === "connecting") return;
 
-    // ORDEN CRÍTICO: iniciar keepAlive y desbloquear AudioContext de forma síncrona
-    // dentro del gesto del usuario antes de cualquier `await`.
-    keepAliveRef.current?.start();
-    earconsRef.current?.unlock();
+      // ORDEN CRÍTICO: iniciar keepAlive y desbloquear AudioContext de forma síncrona
+      // dentro del gesto del usuario antes de cualquier `await`.
+      keepAliveRef.current?.start();
+      earconsRef.current?.unlock();
 
-    const trimmedName = userName.trim();
-    const trimmedRoom = roomInput.trim();
-    if (trimmedName) {
-      window.localStorage.setItem("companionUserName", trimmedName);
-    }
-
-    setErrorMsg(null);
-    setNeedsAudioTap(false);
-    setStatus("connecting");
-
-    let room: Room | null = null;
-    try {
-      const { serverUrl, token, sharedCode, resolvedName } = await fetchToken(
-        trimmedName,
-        trimmedRoom,
-      );
-
-      room = new Room({
-        adaptiveStream: false,
-        dynacast: false,
-        audioCaptureDefaults: AUDIO_CAPTURE_OPTIONS,
-        publishDefaults: {
-          audioPreset: AudioPresets.speech,
-          dtx: true,
-          red: true,
-          stopMicTrackOnMute: false,
-        },
-      });
-      roomRef.current = room;
-
-      const syncParticipants = () => {
-        if (!room) return;
-        setParticipants(getHumanParticipantsList(room, resolvedName));
-      };
-
-      const mapAgentState = (participant: RemoteParticipant) => {
-        if (participant.kind !== ParticipantKind.AGENT) return;
-        const agentState = participant.attributes["lk.agent.state"];
-        if (agentState === "speaking") {
-          setStatus("speaking");
-        } else if (agentState === "thinking") {
-          setStatus("thinking");
-        } else {
-          setStatus("listening");
-        }
-      };
-
-      room.on(RoomEvent.TrackSubscribed, (track) => {
-        if (track.kind !== Track.Kind.Audio) return;
-        const el = track.attach();
-        el.setAttribute("playsinline", "");
-        audioContainerRef.current?.appendChild(el);
-      });
-
-      room.on(RoomEvent.TrackUnsubscribed, (track) => {
-        track.detach().forEach((el) => el.remove());
-      });
-
-      room.on(RoomEvent.ParticipantConnected, (participant) => {
-        if (participant.kind === ParticipantKind.AGENT) {
-          setStatus("listening");
-          earconsRef.current?.agentJoined();
-        } else {
-          syncParticipants();
-        }
-      });
-
-      room.on(RoomEvent.ParticipantDisconnected, (participant) => {
-        if (participant.kind === ParticipantKind.AGENT) {
-          setStatus("waiting");
-        } else {
-          syncParticipants();
-        }
-      });
-
-      room.on(RoomEvent.ParticipantAttributesChanged, (_changed, participant) => {
-        if (participant instanceof RemoteParticipant) {
-          mapAgentState(participant);
-        }
-      });
-
-      room.on(RoomEvent.Reconnecting, () => {
-        setStatus("reconnecting");
-      });
-
-      room.on(RoomEvent.Reconnected, () => {
-        if (room) {
-          syncParticipants();
-          setStatus(hasAgentParticipant(room) ? "listening" : "waiting");
-        }
-      });
-
-      room.on(RoomEvent.Disconnected, () => {
-        if (roomRef.current === room) {
-          cleanup(true);
-        }
-      });
-
-      room.on(RoomEvent.AudioPlaybackStatusChanged, () => {
-        if (room && !room.canPlaybackAudio) {
-          setNeedsAudioTap(true);
-        } else {
-          setNeedsAudioTap(false);
-        }
-      });
-
-      room.on(RoomEvent.MediaDevicesError, () => {
-        setErrorMsg("No se pudo acceder al micrófono");
-        setStatus("error");
-      });
-
-      await room.connect(serverUrl, token);
-      await room.localParticipant.setMicrophoneEnabled(
-        true,
-        AUDIO_CAPTURE_OPTIONS,
-      );
-      await room.startAudio();
-      setNeedsAudioTap(!room.canPlaybackAudio);
-
-      setActiveRoomCode(sharedCode || null);
-      syncParticipants();
-
-      setupMediaSession({
-        onToggleMute: () => {
-          void toggleMute();
-        },
-        onHangup: () => {
-          void hangup();
-        },
-      });
-      earconsRef.current?.connected();
-
-      setStatus(hasAgentParticipant(room) ? "listening" : "waiting");
-    } catch (err) {
-      if (room) {
-        await room.disconnect().catch(() => {});
+      const trimmedName = userName.trim();
+      const trimmedRoom = (overrideRoomCode ?? roomInput).trim();
+      if (overrideRoomCode !== undefined) {
+        setRoomInput(overrideRoomCode);
       }
-      cleanup(false);
-      const message =
-        err instanceof Error ? err.message : "Error inesperado al conectar";
-      setErrorMsg(message);
-      setStatus("error");
-    }
-  }, [cleanup, fetchToken, hangup, roomInput, status, toggleMute, userName]);
+      if (trimmedName) {
+        window.localStorage.setItem("companionUserName", trimmedName);
+      }
+
+      setErrorMsg(null);
+      setNeedsAudioTap(false);
+      setStatus("connecting");
+
+      let room: Room | null = null;
+      try {
+        const { serverUrl, token, sharedCode, resolvedName } = await fetchToken(
+          trimmedName,
+          trimmedRoom,
+        );
+
+        room = new Room({
+          adaptiveStream: false,
+          dynacast: false,
+          audioCaptureDefaults: AUDIO_CAPTURE_OPTIONS,
+          publishDefaults: {
+            audioPreset: AudioPresets.speech,
+            dtx: true,
+            red: true,
+            stopMicTrackOnMute: false,
+          },
+        });
+        roomRef.current = room;
+
+        const syncParticipants = () => {
+          if (!room) return;
+          setParticipants(getHumanParticipantsList(room, resolvedName));
+        };
+
+        const mapAgentState = (participant: RemoteParticipant) => {
+          if (participant.kind !== ParticipantKind.AGENT) return;
+          const agentState = participant.attributes["lk.agent.state"];
+          if (agentState === "speaking") {
+            setStatus("speaking");
+          } else if (agentState === "thinking") {
+            setStatus("thinking");
+          } else {
+            setStatus("listening");
+          }
+        };
+
+        room.on(RoomEvent.TrackSubscribed, (track) => {
+          if (track.kind !== Track.Kind.Audio) return;
+          const el = track.attach();
+          el.setAttribute("playsinline", "");
+          audioContainerRef.current?.appendChild(el);
+        });
+
+        room.on(RoomEvent.TrackUnsubscribed, (track) => {
+          track.detach().forEach((el) => el.remove());
+        });
+
+        room.on(RoomEvent.ParticipantConnected, (participant) => {
+          if (participant.kind === ParticipantKind.AGENT) {
+            setStatus("listening");
+            earconsRef.current?.agentJoined();
+          } else {
+            syncParticipants();
+          }
+        });
+
+        room.on(RoomEvent.ParticipantDisconnected, (participant) => {
+          if (participant.kind === ParticipantKind.AGENT) {
+            setStatus("waiting");
+          } else {
+            syncParticipants();
+          }
+        });
+
+        room.on(
+          RoomEvent.ParticipantAttributesChanged,
+          (_changed, participant) => {
+            if (participant instanceof RemoteParticipant) {
+              mapAgentState(participant);
+            }
+          },
+        );
+
+        room.on(RoomEvent.Reconnecting, () => {
+          setStatus("reconnecting");
+        });
+
+        room.on(RoomEvent.Reconnected, () => {
+          if (room) {
+            syncParticipants();
+            setStatus(hasAgentParticipant(room) ? "listening" : "waiting");
+          }
+        });
+
+        room.on(RoomEvent.Disconnected, () => {
+          if (roomRef.current === room) {
+            cleanup(true);
+          }
+        });
+
+        room.on(RoomEvent.AudioPlaybackStatusChanged, () => {
+          if (room && !room.canPlaybackAudio) {
+            setNeedsAudioTap(true);
+          } else {
+            setNeedsAudioTap(false);
+          }
+        });
+
+        room.on(RoomEvent.MediaDevicesError, () => {
+          setErrorMsg("No se pudo acceder al micrófono");
+          setStatus("error");
+        });
+
+        await room.connect(serverUrl, token);
+        await room.localParticipant.setMicrophoneEnabled(
+          true,
+          AUDIO_CAPTURE_OPTIONS,
+        );
+        await room.startAudio();
+        setNeedsAudioTap(!room.canPlaybackAudio);
+
+        setActiveRoomCode(sharedCode || null);
+        syncParticipants();
+
+        setupMediaSession({
+          onToggleMute: () => {
+            void toggleMute();
+          },
+          onHangup: () => {
+            void hangup();
+          },
+        });
+        earconsRef.current?.connected();
+
+        setStatus(hasAgentParticipant(room) ? "listening" : "waiting");
+      } catch (err) {
+        if (room) {
+          await room.disconnect().catch(() => {});
+        }
+        cleanup(false);
+        const message =
+          err instanceof Error ? err.message : "Error inesperado al conectar";
+        setErrorMsg(message);
+        setStatus("error");
+      }
+    },
+    [cleanup, fetchToken, hangup, roomInput, status, toggleMute, userName],
+  );
 
   const handleShareRoom = useCallback(async () => {
     if (!activeRoomCode || typeof window === "undefined") return;
@@ -500,26 +546,65 @@ export function VoiceCompanion() {
         </div>
 
         {!isConnected && !isConnecting && (
-          <div className="room-form">
-            <input
-              type="text"
-              className="room-input"
-              placeholder="Tu nombre (opcional, ej. Carlos)"
-              value={userName}
-              maxLength={32}
-              onChange={(e) => setUserName(e.target.value)}
-              aria-label="Tu nombre"
-            />
-            <input
-              type="text"
-              className="room-input"
-              placeholder="Sala compartida (vacío = individual)"
-              value={roomInput}
-              maxLength={40}
-              onChange={(e) => setRoomInput(e.target.value)}
-              aria-label="Código de sala compartida"
-            />
-          </div>
+          <>
+            <div className="room-form">
+              <input
+                type="text"
+                className="room-input"
+                placeholder="Tu nombre (opcional, ej. Carlos)"
+                value={userName}
+                maxLength={32}
+                onChange={(e) => setUserName(e.target.value)}
+                aria-label="Tu nombre"
+              />
+              <input
+                type="text"
+                className="room-input"
+                placeholder="Nombre de sala (vacío = nueva sala)"
+                value={roomInput}
+                maxLength={40}
+                onChange={(e) => setRoomInput(e.target.value)}
+                aria-label="Código de sala compartida"
+              />
+            </div>
+
+            <div className="active-rooms-box">
+              <div className="active-rooms-header">
+                <span className="live-indicator" aria-hidden="true" />
+                <span>Salas activas en vivo ({activeRooms.length})</span>
+              </div>
+
+              {activeRooms.length === 0 ? (
+                <p className="active-rooms-empty">
+                  Nadie conectado ahora. Pulsa Conectar para abrir una sala.
+                </p>
+              ) : (
+                <ul className="active-rooms-list">
+                  {activeRooms.map((r) => (
+                    <li key={r.roomName} className="active-room-item">
+                      <div className="active-room-info">
+                        <span className="active-room-title">
+                          Sala <strong>{r.sharedCode}</strong>
+                        </span>
+                        <span className="active-room-people">
+                          {r.participants.join(", ")} (
+                          {r.participantCount}{" "}
+                          {r.participantCount === 1 ? "persona" : "personas"})
+                        </span>
+                      </div>
+                      <button
+                        type="button"
+                        className="join-room-btn"
+                        onClick={() => void connect(r.sharedCode)}
+                      >
+                        Unirse
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          </>
         )}
 
         {isConnected && (
@@ -564,7 +649,7 @@ export function VoiceCompanion() {
 
       <footer className="hint-footer">
         Puedes apagar la pantalla. Play/pausa de tus audífonos = silenciar/activar
-        micrófono. Comparte el mismo código de sala para hablar en grupo.
+        micrófono. Cualquier persona puede unirse a tu sala activa desde la lista.
       </footer>
     </main>
   );
