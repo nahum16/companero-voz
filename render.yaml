@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: companero-voz-agent
+    runtime: docker
+    plan: free
+    rootDir: agent
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /
+    envVars:
+      - key: LIVEKIT_URL
+        sync: false
+      - key: LIVEKIT_API_KEY
+        sync: false
+      - key: LIVEKIT_API_SECRET
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GROQ_LLM_MODEL
+        value: llama-3.3-70b-versatile
+      - key: EDGE_TTS_VOICE
+        value: es-CL-LorenzoNeural
+      - key: AGENT_IDLE_PROCESSES
+        value: "1"

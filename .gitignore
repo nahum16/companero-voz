@@ -1,0 +1,21 @@
+# Dependencias y compilación Node / Next.js
+node_modules/
+.next/
+out/
+.vercel/
+
+# Variables de entorno
+.env
+.env.local
+.env.*.local
+
+# Entornos y artefactos Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Sistema operativo
+.DS_Store
+Thumbs.db
