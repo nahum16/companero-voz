@@ -34,6 +34,17 @@ interface ActiveRoomInfo {
   hasAgent: boolean;
 }
 
+interface QuotaInfo {
+  model: string;
+  limitRequests: number | null;
+  remainingRequests: number | null;
+  resetRequests: string | null;
+  limitTokens: number | null;
+  remainingTokens: number | null;
+  resetTokens: string | null;
+  updatedAt: string;
+}
+
 const STATUS_LABELS: Record<Status, string> = {
   idle: "Listo para conectar",
   connecting: "Conectando…",
@@ -71,6 +82,11 @@ function getHumanParticipantsList(room: Room, localName: string): string[] {
   return names;
 }
 
+function calcPercentage(remaining: number | null, limit: number | null): number {
+  if (remaining === null || limit === null || limit <= 0) return 0;
+  return Math.max(0, Math.min(100, Math.round((remaining / limit) * 100)));
+}
+
 export function VoiceCompanion() {
   const [status, setStatus] = useState<Status>("idle");
   const [muted, setMuted] = useState(false);
@@ -83,6 +99,9 @@ export function VoiceCompanion() {
   const [participants, setParticipants] = useState<string[]>([]);
   const [copiedLink, setCopiedLink] = useState(false);
   const [activeRooms, setActiveRooms] = useState<ActiveRoomInfo[]>([]);
+
+  const [quota, setQuota] = useState<QuotaInfo | null>(null);
+  const [loadingQuota, setLoadingQuota] = useState(false);
 
   const roomRef = useRef<Room | null>(null);
   const mutedRef = useRef(false);
@@ -109,6 +128,27 @@ export function VoiceCompanion() {
       setRoomInput(salaParam);
     }
   }, []);
+
+  const refreshQuota = useCallback(async (force = false) => {
+    setLoadingQuota(true);
+    try {
+      const url = force ? "/api/groq-quota?refresh=1" : "/api/groq-quota";
+      const res = await fetch(url, { cache: "no-store" });
+      if (!res.ok) return;
+      const data = (await res.json()) as QuotaInfo;
+      if (data && typeof data.model === "string") {
+        setQuota(data);
+      }
+    } catch {
+      // Ignorar errores de red al consultar cuota
+    } finally {
+      setLoadingQuota(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshQuota(false);
+  }, [refreshQuota]);
 
   const refreshActiveRooms = useCallback(async () => {
     try {
@@ -156,8 +196,9 @@ export function VoiceCompanion() {
         earconsRef.current?.disconnected();
       }
       void refreshActiveRooms();
+      void refreshQuota(true);
     },
-    [refreshActiveRooms],
+    [refreshActiveRooms, refreshQuota],
   );
 
   const toggleMute = useCallback(async () => {
@@ -522,6 +563,15 @@ export function VoiceCompanion() {
         ? "Conectando…"
         : "Conectar";
 
+  const reqPct = calcPercentage(
+    quota?.remainingRequests ?? null,
+    quota?.limitRequests ?? null,
+  );
+  const tokPct = calcPercentage(
+    quota?.remainingTokens ?? null,
+    quota?.limitTokens ?? null,
+  );
+
   return (
     <main className="companion-shell">
       <div ref={audioContainerRef} hidden aria-hidden="true" />
@@ -636,6 +686,54 @@ export function VoiceCompanion() {
                   {copiedLink ? "¡Enlace copiado!" : "Invitar a la sala"}
                 </button>
               )}
+            </div>
+          </div>
+        )}
+
+        {quota && (
+          <div className="quota-box" aria-label="Cuota gratuita de IA">
+            <div className="quota-header">
+              <span>Cuota gratuita Groq ({quota.model})</span>
+              <button
+                type="button"
+                className="quota-refresh-btn"
+                onClick={() => void refreshQuota(true)}
+                disabled={loadingQuota}
+              >
+                {loadingQuota ? "…" : "↻ Actualizar"}
+              </button>
+            </div>
+
+            <div className="quota-item">
+              <div className="quota-row">
+                <span>Respuestas hoy (RPD)</span>
+                <strong>
+                  {quota.remainingRequests?.toLocaleString("es") ?? "—"} /{" "}
+                  {quota.limitRequests?.toLocaleString("es") ?? "—"} ({reqPct}%)
+                </strong>
+              </div>
+              <div className="quota-bar">
+                <div
+                  className="quota-bar-fill"
+                  style={{ width: `${reqPct}%` }}
+                />
+              </div>
+            </div>
+
+            <div className="quota-item">
+              <div className="quota-row">
+                <span>Tokens por minuto (TPM)</span>
+                <strong>
+                  {quota.remainingTokens?.toLocaleString("es") ?? "—"} /{" "}
+                  {quota.limitTokens?.toLocaleString("es") ?? "—"} ({tokPct}%)
+                </strong>
+              </div>
+              <div className="quota-bar">
+                <div
+                  className="quota-bar-fill is-tokens"
+                  style={{ width: `${tokPct}%` }}
+                />
+              </div>
             </div>
           </div>
         )}
