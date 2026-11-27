@@ -36,6 +36,8 @@ interface ActiveRoomInfo {
 
 interface QuotaInfo {
   model: string;
+  totalKeys?: number;
+  activeKeys?: number;
   limitRequests: number | null;
   remainingRequests: number | null;
   resetRequests: string | null;
@@ -693,7 +695,10 @@ export function VoiceCompanion() {
         {quota && (
           <div className="quota-box" aria-label="Cuota gratuita de IA">
             <div className="quota-header">
-              <span>Cuota gratuita Groq ({quota.model})</span>
+              <span>
+                Cuota Groq ({quota.activeKeys ?? 1}/{quota.totalKeys ?? 1}{" "}
+                {(quota.totalKeys ?? 1) === 1 ? "cuenta" : "cuentas"})
+              </span>
               <button
                 type="button"
                 className="quota-refresh-btn"

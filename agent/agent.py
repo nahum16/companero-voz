@@ -1,4 +1,5 @@
 import asyncio
+import itertools
 import logging
 import os
 import re
@@ -46,6 +47,41 @@ _WHISPER_HALLUCINATION_RE = re.compile(
 )
 
 
+def load_groq_keys() -> list[str]:
+    """Obtiene la lista de claves de Groq desde GROQ_API_KEYS y GROQ_API_KEY sin duplicados."""
+    raw_multi = os.getenv("GROQ_API_KEYS", "")
+    raw_single = os.getenv("GROQ_API_KEY", "")
+    candidates = [k.strip() for k in raw_multi.split(",") if k.strip()]
+    if raw_single.strip():
+        candidates.append(raw_single.strip())
+
+    unique: list[str] = []
+    for key in candidates:
+        if key not in unique:
+            unique.append(key)
+    return unique
+
+
+GROQ_KEYS = load_groq_keys()
+_key_cycle = itertools.cycle(range(max(len(GROQ_KEYS), 1)))
+
+
+def next_key_index() -> int:
+    return next(_key_cycle)
+
+
+def build_groq_llm(api_key: str, model_name: str) -> groq.LLM:
+    llm_kwargs: dict[str, Any] = {
+        "model": model_name,
+        "api_key": api_key,
+        "temperature": 0.7,
+        "max_completion_tokens": 220,
+    }
+    if "qwen" in model_name.lower():
+        llm_kwargs["reasoning_effort"] = "none"
+    return groq.LLM(**llm_kwargs)
+
+
 def _human_participants(room: rtc.Room) -> list[rtc.RemoteParticipant]:
     return [
         p
@@ -55,18 +91,20 @@ def _human_participants(room: rtc.Room) -> list[rtc.RemoteParticipant]:
 
 
 class Companion(Agent):
-    """Agente conversacional optimizado para charla individual o grupal por audífonos."""
+    """Agente conversacional con rotación automática multi-cuenta y multi-modelo en Groq."""
 
     def __init__(
         self,
         *,
         room: rtc.Room | None = None,
         multi_input: MultiParticipantAudioInput | None = None,
+        initial_key_idx: int = 0,
     ) -> None:
         super().__init__(instructions=SYSTEM_PROMPT)
         self._room = room
         self._multi_input = multi_input
         self._turn_speakers: dict[str, str] = {}
+        self._key_idx = initial_key_idx
 
     async def on_user_turn_completed(
         self,
@@ -111,8 +149,55 @@ class Companion(Agent):
                                 update={"content": [f"{prefix}{text}"]},
                             )
 
-        async for chunk in Agent.default.llm_node(self, trimmed, tools, model_settings):
-            yield chunk
+        if not GROQ_KEYS:
+            async for chunk in Agent.default.llm_node(self, trimmed, tools, model_settings):
+                yield chunk
+            return
+
+        primary_model = os.getenv("GROQ_LLM_MODEL", "qwen/qwen3.8-27b")
+        models_order = [primary_model]
+        for fallback_model in ("openai/gpt-oss-120b", "openai/gpt-oss-20b"):
+            if fallback_model not in models_order:
+                models_order.append(fallback_model)
+
+        num_keys = len(GROQ_KEYS)
+        start_idx = self._key_idx % num_keys
+        # Avanzar el índice para balancear turnos entre todas las cuentas disponibles
+        self._key_idx = (start_idx + 1) % num_keys
+
+        last_err: Exception | None = None
+        for model_name in models_order:
+            for offset in range(num_keys):
+                idx = (start_idx + offset) % num_keys
+                api_key = GROQ_KEYS[idx]
+                emitted_any = False
+                try:
+                    llm_instance = build_groq_llm(api_key, model_name)
+                    tool_choice = model_settings.tool_choice if model_settings else None
+                    async with llm_instance.chat(
+                        chat_ctx=trimmed,
+                        tools=tools,
+                        tool_choice=tool_choice,
+                    ) as stream:
+                        async for chunk in stream:
+                            emitted_any = True
+                            yield chunk
+                    return
+                except Exception as exc:
+                    last_err = exc
+                    if emitted_any:
+                        raise
+                    logger.warning(
+                        "Clave Groq #%d (%s...) falló con %s (%s); rotando a la siguiente cuenta...",
+                        idx + 1,
+                        api_key[:10],
+                        model_name,
+                        exc,
+                    )
+                    continue
+
+        if last_err is not None:
+            raise last_err
 
     async def tts_node(
         self,
@@ -128,8 +213,6 @@ class Companion(Agent):
 
 
 def prewarm(proc: JobProcess) -> None:
-    # Un umbral de activación más alto (0.6 frente a 0.5) filtra ruido de viento y tráfico.
-    # Un silencio mínimo de 0.6 s evita cortar pausas naturales al hablar caminando.
     proc.userdata["vad"] = silero.VAD.load(
         min_speech_duration=0.15,
         min_silence_duration=float(os.getenv("VAD_MIN_SILENCE", "0.6")),
@@ -151,17 +234,16 @@ server = AgentServer(
 @server.rtc_session()
 async def entrypoint(ctx: JobContext) -> None:
     await ctx.connect()
-    logger.info("Agente conectado a la sala %s", ctx.room.name)
+    key_idx = next_key_index()
+    active_key = GROQ_KEYS[key_idx] if GROQ_KEYS else os.getenv("GROQ_API_KEY", "")
+    logger.info(
+        "Agente conectado a la sala %s [pool Groq: %d cuentas, iniciando con cuenta #%d]",
+        ctx.room.name,
+        len(GROQ_KEYS),
+        key_idx + 1,
+    )
 
     model_name = os.getenv("GROQ_LLM_MODEL", "qwen/qwen3.8-27b")
-    llm_kwargs: dict[str, Any] = {
-        "model": model_name,
-        "temperature": 0.7,
-        "max_completion_tokens": 220,
-    }
-    if "qwen" in model_name.lower():
-        llm_kwargs["reasoning_effort"] = "none"
-
     edge_voice = os.getenv("EDGE_TTS_VOICE", "es-CL-LorenzoNeural")
     edge_rate = os.getenv("EDGE_TTS_RATE", "+5%")
 
@@ -172,10 +254,11 @@ async def entrypoint(ctx: JobContext) -> None:
         vad=ctx.proc.userdata["vad"],
         stt=groq.STT(
             model="whisper-large-v3-turbo",
+            api_key=active_key,
             language="es",
             prompt="Conversación casual en español latinoamericano.",
         ),
-        llm=groq.LLM(**llm_kwargs),
+        llm=build_groq_llm(active_key, model_name),
         tts=tts.StreamAdapter(
             tts=EdgeTTS(voice=edge_voice, rate=edge_rate),
             sentence_tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=12),
@@ -187,9 +270,6 @@ async def entrypoint(ctx: JobContext) -> None:
                 "min_delay": 0.5,
                 "max_delay": 3.0,
             },
-            # Desactivar `resume_false_interruption` evita que `_ParticipantAudioOutput`
-            # quede en estado `paused` permanente cuando ocurren interrupciones seguidas
-            # en salas con dos o más personas.
             "interruption": {
                 "enabled": True,
                 "mode": "vad",
@@ -206,7 +286,6 @@ async def entrypoint(ctx: JobContext) -> None:
     empty_room_task: asyncio.Task[None] | None = None
 
     async def _close_if_still_empty() -> None:
-        # Margen de 15 s por si alguien sale un momento a compartir el enlace y vuelve
         await asyncio.sleep(15.0)
         if not _human_participants(ctx.room):
             logger.info(
@@ -249,7 +328,11 @@ async def entrypoint(ctx: JobContext) -> None:
     ctx.add_shutdown_callback(multi_input.aclose)
 
     await session.start(
-        agent=Companion(room=ctx.room, multi_input=multi_input),
+        agent=Companion(
+            room=ctx.room,
+            multi_input=multi_input,
+            initial_key_idx=key_idx,
+        ),
         room=ctx.room,
         room_options=room_io.RoomOptions(
             audio_input=False,
