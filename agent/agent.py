@@ -283,13 +283,18 @@ class Companion(Agent):
             chat_ctx.items and isinstance(chat_ctx.items[-1], llm.FunctionCallOutput)
         )
 
-        raw_last_user_text = ""
+        recent_texts: list[str] = []
         for item in reversed(chat_ctx.items):
-            if isinstance(item, llm.ChatMessage) and item.role == "user":
-                raw_last_user_text = (item.text_content or "").strip()
-                break
+            if isinstance(item, llm.ChatMessage) and item.role in ("user", "assistant"):
+                txt = (item.text_content or "").strip()
+                if txt:
+                    recent_texts.append(txt)
+                if len(recent_texts) >= 3:
+                    break
 
-        enable_fs_tool = (not has_trailing_tool_output) and is_file_action_request(raw_last_user_text)
+        enable_fs_tool = (not has_trailing_tool_output) and any(
+            is_file_action_request(t) for t in recent_texts
+        )
         active_tools = tools if enable_fs_tool else []
 
         speaker = self._multi_input.last_active_speaker if self._multi_input else None
