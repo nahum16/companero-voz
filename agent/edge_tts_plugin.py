@@ -312,7 +312,8 @@ async def _synthesize_trimmed_frames(
 ) -> list[rtc.AudioFrame]:
     """Sintetiza un bloque de texto en Edge TTS, decodifica a PCM 24 kHz y recorta silencios muertos."""
     is_singing, spoken_text = parse_sing_utterance(raw_text)
-    if not _WORD_RE.search(spoken_text):
+    alpha_only = re.sub(r"[^\w]", "", spoken_text, flags=re.UNICODE)
+    if len(alpha_only) <= 1:
         return []
 
     rate = "+0%" if is_singing else edge_tts_plugin._rate

@@ -36,15 +36,92 @@ MAX_TURNS = 12
 
 # Frases típicas de alucinación de Whisper ante ruido de fondo o silencios
 _WHISPER_HALLUCINATION_RE = re.compile(
-    r"^\s*(?:"
-    r"gracias por ver(?: el video)?\.?|"
+    r"^\s*[¡!¿?\s]*(?:"
+    r"gracias por ver(?: el video)?|"
     r"subt[ií]tulos realizados por.*|"
     r"subt[ií]tulos por.*|"
-    r"suscr[ií]bete(?: al canal)?\.?|"
-    r"m[uú]sica\.?"
-    r")\s*$",
+    r"suscr[ií]bete(?: al canal)?|"
+    r"conversaci[oó]n casual en espa[ñn]ol(?: latinoamericano)?|"
+    r"m[uú]sica"
+    r")[.¡!¿?\s]*$",
     re.IGNORECASE,
 )
+
+
+def _extract_chunk_text(chunk: Any) -> str:
+    if isinstance(chunk, str):
+        return chunk
+    delta = getattr(chunk, "delta", None)
+    if delta is not None:
+        return getattr(delta, "content", None) or ""
+    return ""
+
+
+def is_stub_assistant_text(text: str) -> bool:
+    """Detecta respuestas truncadas por interrupción temprana ('M', 'J', 'De', 'Ay,', 'Uf, por')."""
+    cleaned = text.strip()
+    if len(cleaned) < 12:
+        # Permitir sólo respuestas cortas completas válidas con puntuación final (ej. '¡Claro!', 'Vale.')
+        words = re.findall(r"\w+", cleaned, re.UNICODE)
+        if not words or len(words[0]) <= 2 and len(words) == 1:
+            return True
+        if cleaned[-1] not in ".!?¡¿":
+            return True
+    return False
+
+
+def sanitize_chat_context(chat_ctx: llm.ChatContext, max_turns: int = MAX_TURNS) -> llm.ChatContext:
+    """
+    Limpia el historial antes de enviarlo al LLM:
+    1. Elimina fragmentos de 1 letra o frases truncadas del asistente ('M', 'J', 'Ay,', 'Uf, por')
+       que envenenan el contexto few-shot de Qwen.
+    2. Fusiona mensajes consecutivos de rol 'user' en un solo turno para mantener la
+       alternancia estricta user <-> assistant que exige la plantilla ChatML.
+    """
+    raw_copy = chat_ctx.copy(
+        exclude_function_call=True,
+        exclude_handoff=True,
+        exclude_config_update=True,
+    )
+
+    cleaned_items: list[Any] = []
+    for item in raw_copy.items:
+        if not isinstance(item, llm.ChatMessage):
+            cleaned_items.append(item)
+            continue
+
+        if item.role in ("system", "developer"):
+            cleaned_items.append(item)
+            continue
+
+        text = (item.text_content or "").strip()
+        if not text:
+            continue
+
+        if item.role == "assistant":
+            if is_stub_assistant_text(text):
+                continue
+            cleaned_items.append(item)
+            continue
+
+        if item.role == "user":
+            if _WHISPER_HALLUCINATION_RE.match(text):
+                continue
+            if (
+                cleaned_items
+                and isinstance(cleaned_items[-1], llm.ChatMessage)
+                and cleaned_items[-1].role == "user"
+            ):
+                prev_msg = cleaned_items[-1]
+                prev_text = (prev_msg.text_content or "").strip()
+                merged_text = f"{prev_text} {text}".strip() if prev_text else text
+                cleaned_items[-1] = prev_msg.model_copy(update={"content": [merged_text]})
+            else:
+                cleaned_items.append(item)
+
+    raw_copy.items[:] = cleaned_items
+    raw_copy.truncate(max_items=max_turns * 2)
+    return raw_copy
 
 
 def load_groq_keys() -> list[str]:
@@ -77,11 +154,14 @@ def build_groq_llm(api_key: str, model_name: str) -> groq.LLM:
     llm_kwargs: dict[str, Any] = {
         "model": model_name,
         "api_key": api_key,
-        "temperature": 0.85,
+        "temperature": 0.78,
         "max_completion_tokens": 450,
     }
-    if "qwen" in model_name.lower():
+    lower_model = model_name.lower()
+    if "qwen" in lower_model:
         llm_kwargs["reasoning_effort"] = "none"
+    elif "gpt-oss" in lower_model:
+        llm_kwargs["reasoning_effort"] = "low"
     return groq.LLM(**llm_kwargs)
 
 
@@ -134,31 +214,32 @@ class Companion(Agent):
         tools: list[llm.Tool],
         model_settings: ModelSettings,
     ) -> AsyncIterable[llm.ChatChunk | str | Any]:
-        trimmed = chat_ctx.copy(
-            exclude_function_call=True,
-            exclude_handoff=True,
-            exclude_config_update=True,
-        )
-        trimmed.truncate(max_items=MAX_TURNS * 2)
-
         speaker = self._multi_input.last_active_speaker if self._multi_input else None
         humans = _human_participants(self._room) if self._room else []
         should_tag = bool(speaker) and (len(humans) > 1 or speaker != "Usuario")
 
+        working_ctx = chat_ctx.copy(
+            exclude_function_call=True,
+            exclude_handoff=True,
+            exclude_config_update=True,
+        )
+
         if should_tag and speaker:
-            for idx, item in enumerate(trimmed.items):
+            for idx, item in enumerate(working_ctx.items):
                 if isinstance(item, llm.ChatMessage) and item.role == "user":
                     msg_speaker = self._turn_speakers.get(item.id)
-                    if msg_speaker is None and idx == len(trimmed.items) - 1:
+                    if msg_speaker is None and idx == len(working_ctx.items) - 1:
                         msg_speaker = speaker
                         self._turn_speakers[item.id] = speaker
-                    if msg_speaker:
+                    if msg_speaker and msg_speaker != "Usuario":
                         text = item.text_content or ""
                         prefix = f"[{msg_speaker}]: "
                         if text and not text.startswith(prefix):
-                            trimmed.items[idx] = item.model_copy(
+                            working_ctx.items[idx] = item.model_copy(
                                 update={"content": [f"{prefix}{text}"]},
                             )
+
+        trimmed = sanitize_chat_context(working_ctx, max_turns=MAX_TURNS)
 
         if not GROQ_KEYS:
             async for chunk in Agent.default.llm_node(self, trimmed, tools, model_settings):
@@ -180,7 +261,9 @@ class Companion(Agent):
             for offset in range(num_keys):
                 idx = (start_idx + offset) % num_keys
                 api_key = GROQ_KEYS[idx]
-                emitted_any = False
+                flushed_to_caller = False
+                initial_chunks: list[Any] = []
+                accumulated_text = ""
                 try:
                     llm_instance = build_groq_llm(api_key, model_name)
                     tool_choice = model_settings.tool_choice if model_settings else None
@@ -190,12 +273,29 @@ class Companion(Agent):
                         tool_choice=tool_choice,
                     ) as stream:
                         async for chunk in stream:
-                            emitted_any = True
-                            yield chunk
+                            if not flushed_to_caller:
+                                initial_chunks.append(chunk)
+                                accumulated_text += _extract_chunk_text(chunk)
+                                if len(accumulated_text.strip()) >= 4:
+                                    flushed_to_caller = True
+                                    for pending in initial_chunks:
+                                        yield pending
+                                    initial_chunks.clear()
+                            else:
+                                yield chunk
+
+                    if not flushed_to_caller:
+                        logger.warning(
+                            "Modelo %s (clave #%d) devolvió respuesta vacía o truncada (%r); probando siguiente modelo...",
+                            model_name,
+                            idx + 1,
+                            accumulated_text,
+                        )
+                        break
                     return
                 except Exception as exc:
                     last_err = exc
-                    if emitted_any:
+                    if flushed_to_caller:
                         raise
                     logger.warning(
                         "Clave Groq #%d (%s...) falló con %s (%s); rotando a la siguiente cuenta...",
@@ -224,10 +324,10 @@ class Companion(Agent):
 
 def prewarm(proc: JobProcess) -> None:
     proc.userdata["vad"] = silero.VAD.load(
-        min_speech_duration=0.12,
-        min_silence_duration=float(os.getenv("VAD_MIN_SILENCE", "0.50")),
+        min_speech_duration=0.22,
+        min_silence_duration=float(os.getenv("VAD_MIN_SILENCE", "0.60")),
         prefix_padding_duration=0.3,
-        activation_threshold=float(os.getenv("VAD_ACTIVATION_THRESHOLD", "0.5")),
+        activation_threshold=float(os.getenv("VAD_ACTIVATION_THRESHOLD", "0.55")),
         sample_rate=16000,
     )
 
@@ -267,7 +367,6 @@ async def entrypoint(ctx: JobContext) -> None:
             model="whisper-large-v3-turbo",
             api_key=active_key,
             language="es",
-            prompt="Conversación casual en español latinoamericano.",
         ),
         llm=build_groq_llm(active_key, model_name),
         tts=edge_tts_plugin,
@@ -278,13 +377,13 @@ async def entrypoint(ctx: JobContext) -> None:
             },
             "endpointing": {
                 "mode": "fixed",
-                "min_delay": 0.30,
+                "min_delay": 0.50,
                 "max_delay": 2.5,
             },
             "interruption": {
                 "enabled": True,
                 "mode": "vad",
-                "min_duration": 0.7,
+                "min_duration": 0.85,
                 "resume_false_interruption": False,
                 "false_interruption_timeout": None,
             },

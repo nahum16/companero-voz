@@ -108,3 +108,29 @@ def test_extract_breath_segment_preserva_muletillas_y_puntos_suspensivos():
     assert seg == "Mmm... mira, la verdad es que sí me parece una locura total."
     assert rest.startswith("Y además")
 
+
+def test_sanitize_chat_context_elimina_stubs_y_fusiona_turnos_usuario():
+    from livekit.agents import llm
+    from agent import is_stub_assistant_text, sanitize_chat_context
+
+    assert is_stub_assistant_text("M") is True
+    assert is_stub_assistant_text("J") is True
+    assert is_stub_assistant_text("Uf, por") is True
+    assert is_stub_assistant_text("Vale.") is False
+
+    ctx = llm.ChatContext()
+    ctx.add_message(role="assistant", content="¡Ey, hola! Qué bueno escucharte... ¿cómo andas?")
+    ctx.add_message(role="user", content="Hola.")
+    ctx.add_message(role="assistant", content="M")
+    ctx.add_message(role="user", content="¿Cómo te llamas?")
+    ctx.add_message(role="assistant", content="J")
+    ctx.add_message(role="user", content="¡Suscríbete al canal!")
+    ctx.add_message(role="user", content="Respóndeme por favor.")
+
+    cleaned = sanitize_chat_context(ctx)
+    roles = [m.role for m in cleaned.items if isinstance(m, llm.ChatMessage)]
+    texts = [m.text_content for m in cleaned.items if isinstance(m, llm.ChatMessage)]
+    assert roles == ["assistant", "user"]
+    assert texts[1] == "Hola. ¿Cómo te llamas? Respóndeme por favor."
+
+
