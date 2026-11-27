@@ -89,7 +89,7 @@ async def entrypoint(ctx: JobContext) -> None:
     await ctx.connect()
     logger.info("Agente conectado a la sala %s", ctx.room.name)
 
-    model_name = os.getenv("GROQ_LLM_MODEL", "llama-3.3-70b-versatile")
+    model_name = os.getenv("GROQ_LLM_MODEL", "qwen/qwen3.8-27b")
     llm_kwargs: dict[str, Any] = {
         "model": model_name,
         "temperature": 0.7,

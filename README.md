@@ -192,7 +192,7 @@ docker run --rm --env-file .env -p 8081:8081 companero-agent
 
 | Variable | Por defecto | Descripción |
 | :--- | :--- | :--- |
-| `GROQ_LLM_MODEL` | `llama-3.3-70b-versatile` | Modelo de lenguaje en Groq. Otra opción rápida es `qwen/qwen3-32b`. *(Nota: `"qwen3.8-27b"` no es un ID conocido en Groq; consulta los IDs vigentes en [console.groq.com/docs/models](https://console.groq.com/docs/models)).* |
+| `GROQ_LLM_MODEL` | `qwen/qwen3.8-27b` | Modelo de lenguaje en Groq (otras opciones activas: `openai/gpt-oss-120b`, `openai/gpt-oss-20b`). |
 | `EDGE_TTS_VOICE` | `es-CL-LorenzoNeural` | Voz neuronal de Edge TTS (por ejemplo `es-ES-AlvaroNeural`, `es-MX-JorgeNeural`, `es-AR-TomasNeural`). |
 | `EDGE_TTS_RATE` | `+5%` | Velocidad de locución (`+0%`, `+10%`, `-5%`, etc.). |
 | `VAD_ACTIVATION_THRESHOLD` | `0.6` | Sensibilidad de detección de voz de Silero VAD (subir a `0.65`–`0.7` si hay mucho viento). |

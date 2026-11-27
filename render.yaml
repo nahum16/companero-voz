@@ -16,7 +16,7 @@ services:
       - key: GROQ_API_KEY
         sync: false
       - key: GROQ_LLM_MODEL
-        value: llama-3.3-70b-versatile
+        value: qwen/qwen3.8-27b
       - key: EDGE_TTS_VOICE
         value: es-CL-LorenzoNeural
       - key: AGENT_IDLE_PROCESSES
