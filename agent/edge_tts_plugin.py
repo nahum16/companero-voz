@@ -77,6 +77,16 @@ _COUNTRY_ALIASES: dict[str, str] = {
 
 _ALL_FEMALE_VOICES = {pair[1] for pair in SPANISH_VOICES.values()}
 
+_ACCENT_TRIGGER_RE = re.compile(
+    r"\b(?:"
+    r"acento|voz|ento(?:na|nacion)|"
+    r"habl(?:a|ame|ar|es)\s+(?:como|en|con)|"
+    r"cambi(?:a|ar|ate|es)\s+(?:a|de|tu)|"
+    r"pon(?:te|me|er)?\s+(?:voz|acento|como)"
+    r")\b",
+    re.IGNORECASE,
+)
+
 
 def _strip_accents(text: str) -> str:
     return "".join(
@@ -143,6 +153,31 @@ def resolve_spanish_voice(query: str, current_voice: str = "es-CL-LorenzoNeural"
     chosen = female_v if want_female else male_v
     gender_label = "femenina" if want_female else "masculina"
     return chosen, f"{country} ({gender_label})"
+
+
+def detect_accent_change_request(
+    user_text: str,
+    current_voice: str = "es-CL-LorenzoNeural",
+) -> tuple[str, str] | None:
+    """
+    Si el texto del usuario pide cambiar de acento o de voz, devuelve (nueva_voz, etiqueta);
+    en caso contrario devuelve None.
+    """
+    norm = _strip_accents(user_text)
+    if not _ACCENT_TRIGGER_RE.search(norm):
+        return None
+
+    has_country = any(k in norm for k in SPANISH_VOICES) or any(
+        a in norm for a in _COUNTRY_ALIASES
+    )
+    has_gender = any(
+        w in norm
+        for w in ("mujer", "femenin", "chica", "hombre", "masculin", "chico", "varon")
+    )
+    if not has_country and not has_gender:
+        return None
+
+    return resolve_spanish_voice(user_text, current_voice)
 
 
 def parse_sing_utterance(text: str) -> tuple[bool, str]:

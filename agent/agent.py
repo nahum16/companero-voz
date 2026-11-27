@@ -17,7 +17,6 @@ from livekit.agents import (
     ModelSettings,
     StopResponse,
     cli,
-    function_tool,
     llm,
     room_io,
     tokenize,
@@ -25,7 +24,7 @@ from livekit.agents import (
 )
 from livekit.plugins import groq, silero
 
-from edge_tts_plugin import EdgeTTS, resolve_spanish_voice
+from edge_tts_plugin import EdgeTTS, detect_accent_change_request
 from multi_audio_input import MultiParticipantAudioInput
 from prompts import GREETING, SYSTEM_PROMPT
 from text_utils import speech_text_filter
@@ -72,11 +71,14 @@ def next_key_index() -> int:
 
 
 def build_groq_llm(api_key: str, model_name: str) -> groq.LLM:
+    # Nota: el límite gratuito de Output Tokens Per Minute (OTPM) de qwen/qwen3.8-27b
+    # en Groq es de 1.000 tokens/min por cuenta; 450 tokens (~350 palabras) permite
+    # respuestas largas sin superar el tope OTPM en una sola llamada.
     llm_kwargs: dict[str, Any] = {
         "model": model_name,
         "api_key": api_key,
         "temperature": 0.85,
-        "max_completion_tokens": 1200,
+        "max_completion_tokens": 450,
     }
     if "qwen" in model_name.lower():
         llm_kwargs["reasoning_effort"] = "none"
@@ -92,7 +94,7 @@ def _human_participants(room: rtc.Room) -> list[rtc.RemoteParticipant]:
 
 
 class Companion(Agent):
-    """Agente conversacional con rotación automática multi-cuenta y multi-modelo en Groq."""
+    """Agente conversacional con rotación automática multi-cuenta y cambio de acento en vivo."""
 
     def __init__(
         self,
@@ -109,16 +111,6 @@ class Companion(Agent):
         self._turn_speakers: dict[str, str] = {}
         self._key_idx = initial_key_idx
 
-    @function_tool
-    async def cambiar_acento(self, acento_o_voz: str) -> str:
-        """Cambia el acento o género de la voz del agente en tiempo real (ej. mexicano, argentino, colombiano, español, chileno, venezolano, peruano, cubano, mujer, hombre)."""
-        if self._edge_tts is None:
-            return "No fue posible cambiar la voz en este momento."
-        new_voice, label = resolve_spanish_voice(acento_o_voz, self._edge_tts.voice)
-        self._edge_tts.set_voice(new_voice)
-        logger.info("Voz cambiada en vivo a %s (%s)", new_voice, label)
-        return f"Voz cambiada a {label} ({new_voice}). Responde ya usando este acento."
-
     async def on_user_turn_completed(
         self,
         turn_ctx: llm.ChatContext,
@@ -129,13 +121,19 @@ class Companion(Agent):
             logger.info("Ignorando alucinación de ruido de Whisper: %r", text)
             raise StopResponse()
 
+        if self._edge_tts is not None:
+            accent_match = detect_accent_change_request(text, self._edge_tts.voice)
+            if accent_match is not None:
+                new_voice, label = accent_match
+                self._edge_tts.set_voice(new_voice)
+                logger.info("Voz cambiada en vivo a %s (%s)", new_voice, label)
+
     async def llm_node(
         self,
         chat_ctx: llm.ChatContext,
         tools: list[llm.Tool],
         model_settings: ModelSettings,
     ) -> AsyncIterable[llm.ChatChunk | str | Any]:
-        # Ventana deslizante de los últimos 12 turnos (24 mensajes) conservando el system prompt
         trimmed = chat_ctx.copy(
             exclude_function_call=True,
             exclude_handoff=True,
@@ -175,7 +173,6 @@ class Companion(Agent):
 
         num_keys = len(GROQ_KEYS)
         start_idx = self._key_idx % num_keys
-        # Avanzar el índice para balancear turnos entre todas las cuentas disponibles
         self._key_idx = (start_idx + 1) % num_keys
 
         last_err: Exception | None = None
@@ -227,10 +224,10 @@ class Companion(Agent):
 
 def prewarm(proc: JobProcess) -> None:
     proc.userdata["vad"] = silero.VAD.load(
-        min_speech_duration=0.15,
-        min_silence_duration=float(os.getenv("VAD_MIN_SILENCE", "0.6")),
+        min_speech_duration=0.12,
+        min_silence_duration=float(os.getenv("VAD_MIN_SILENCE", "0.55")),
         prefix_padding_duration=0.3,
-        activation_threshold=float(os.getenv("VAD_ACTIVATION_THRESHOLD", "0.6")),
+        activation_threshold=float(os.getenv("VAD_ACTIVATION_THRESHOLD", "0.5")),
         sample_rate=16000,
     )
 
@@ -281,13 +278,13 @@ async def entrypoint(ctx: JobContext) -> None:
             "turn_detection": "vad",
             "endpointing": {
                 "mode": "fixed",
-                "min_delay": 0.5,
-                "max_delay": 3.0,
+                "min_delay": 0.45,
+                "max_delay": 2.5,
             },
             "interruption": {
                 "enabled": True,
                 "mode": "vad",
-                "min_duration": 0.75,
+                "min_duration": 0.7,
                 "resume_false_interruption": False,
                 "false_interruption_timeout": None,
             },

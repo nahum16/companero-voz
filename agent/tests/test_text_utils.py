@@ -1,6 +1,10 @@
 import asyncio
 
-from edge_tts_plugin import parse_sing_utterance, resolve_spanish_voice
+from edge_tts_plugin import (
+    detect_accent_change_request,
+    parse_sing_utterance,
+    resolve_spanish_voice,
+)
 from text_utils import speech_text_filter
 
 
@@ -71,3 +75,21 @@ def test_resolve_spanish_voice_por_pais_y_genero():
 
     v4, _ = resolve_spanish_voice("español de españa", "es-MX-DaliaNeural")
     assert v4 == "es-ES-ElviraNeural"
+
+
+def test_detect_accent_change_request_solo_dispara_cuando_piden_cambio():
+    assert (
+        detect_accent_change_request("Hola, ¿qué sabes de Argentina?", "es-CL-LorenzoNeural")
+        is None
+    )
+    res = detect_accent_change_request(
+        "Cambia a acento argentino por favor", "es-CL-LorenzoNeural"
+    )
+    assert res is not None
+    assert res[0] == "es-AR-TomasNeural"
+
+    res2 = detect_accent_change_request(
+        "Quiero que hables como mujer venezolana", "es-CL-LorenzoNeural"
+    )
+    assert res2 is not None
+    assert res2[0] == "es-VE-PaolaNeural"
