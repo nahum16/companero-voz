@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 from collections.abc import AsyncIterable
@@ -14,12 +15,14 @@ from livekit.agents import (
     ModelSettings,
     cli,
     llm,
+    room_io,
     tokenize,
     tts,
 )
 from livekit.plugins import groq, silero
 
 from edge_tts_plugin import EdgeTTS
+from multi_audio_input import MultiParticipantAudioInput
 from prompts import GREETING, SYSTEM_PROMPT
 from text_utils import speech_text_filter
 
@@ -29,11 +32,27 @@ logger = logging.getLogger("companero")
 MAX_TURNS = 12
 
 
-class Companion(Agent):
-    """Agente conversacional optimizado para charla fluida por audífonos."""
+def _human_participants(room: rtc.Room) -> list[rtc.RemoteParticipant]:
+    return [
+        p
+        for p in room.remote_participants.values()
+        if p.kind != rtc.ParticipantKind.PARTICIPANT_KIND_AGENT
+    ]
 
-    def __init__(self) -> None:
+
+class Companion(Agent):
+    """Agente conversacional optimizado para charla individual o grupal por audífonos."""
+
+    def __init__(
+        self,
+        *,
+        room: rtc.Room | None = None,
+        multi_input: MultiParticipantAudioInput | None = None,
+    ) -> None:
         super().__init__(instructions=SYSTEM_PROMPT)
+        self._room = room
+        self._multi_input = multi_input
+        self._turn_speakers: dict[str, str] = {}
 
     async def llm_node(
         self,
@@ -48,6 +67,26 @@ class Companion(Agent):
             exclude_config_update=True,
         )
         trimmed.truncate(max_items=MAX_TURNS * 2)
+
+        speaker = self._multi_input.last_active_speaker if self._multi_input else None
+        humans = _human_participants(self._room) if self._room else []
+        should_tag = bool(speaker) and (len(humans) > 1 or speaker != "Usuario")
+
+        if should_tag and speaker:
+            for idx, item in enumerate(trimmed.items):
+                if isinstance(item, llm.ChatMessage) and item.role == "user":
+                    msg_speaker = self._turn_speakers.get(item.id)
+                    if msg_speaker is None and idx == len(trimmed.items) - 1:
+                        msg_speaker = speaker
+                        self._turn_speakers[item.id] = speaker
+                    if msg_speaker:
+                        text = item.text_content or ""
+                        prefix = f"[{msg_speaker}]: "
+                        if text and not text.startswith(prefix):
+                            trimmed.items[idx] = item.model_copy(
+                                update={"content": [f"{prefix}{text}"]},
+                            )
+
         async for chunk in Agent.default.llm_node(self, trimmed, tools, model_settings):
             yield chunk
 
@@ -79,6 +118,7 @@ def prewarm(proc: JobProcess) -> None:
 server = AgentServer(
     setup_fnc=prewarm,
     num_idle_processes=int(os.getenv("AGENT_IDLE_PROCESSES", "1")),
+    load_threshold=0.9,
     port=int(os.getenv("PORT", "8081")),
     job_memory_warn_mb=450,
 )
@@ -100,6 +140,9 @@ async def entrypoint(ctx: JobContext) -> None:
 
     edge_voice = os.getenv("EDGE_TTS_VOICE", "es-CL-LorenzoNeural")
     edge_rate = os.getenv("EDGE_TTS_RATE", "+5%")
+
+    multi_input = MultiParticipantAudioInput(ctx.room)
+    multi_input.start()
 
     session = AgentSession(
         vad=ctx.proc.userdata["vad"],
@@ -131,7 +174,45 @@ async def entrypoint(ctx: JobContext) -> None:
         tts_text_transforms=["filter_markdown", "filter_emoji"],
     )
 
-    await session.start(agent=Companion(), room=ctx.room)
+    # Usar nuestro mezclador multipersona como entrada de audio y mantener la sesión viva
+    # aunque un participante salga mientras queden otras personas en la sala.
+    session.input.audio = multi_input
+
+    empty_room_task: asyncio.Task[None] | None = None
+
+    async def _close_if_still_empty() -> None:
+        await asyncio.sleep(5.0)
+        if not _human_participants(ctx.room):
+            logger.info("Sala %s sin participantes humanos; cerrando sesión.", ctx.room.name)
+            await multi_input.aclose()
+            await session.aclose()
+            ctx.shutdown(reason="Sala vacía")
+
+    def _on_participant_connected(participant: rtc.RemoteParticipant) -> None:
+        nonlocal empty_room_task
+        if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_AGENT:
+            return
+        if empty_room_task is not None:
+            empty_room_task.cancel()
+            empty_room_task = None
+
+    def _on_participant_disconnected(_participant: rtc.RemoteParticipant) -> None:
+        nonlocal empty_room_task
+        if not _human_participants(ctx.room) and empty_room_task is None:
+            empty_room_task = asyncio.create_task(_close_if_still_empty())
+
+    ctx.room.on("participant_connected", _on_participant_connected)
+    ctx.room.on("participant_disconnected", _on_participant_disconnected)
+    ctx.add_shutdown_callback(multi_input.aclose)
+
+    await session.start(
+        agent=Companion(room=ctx.room, multi_input=multi_input),
+        room=ctx.room,
+        room_options=room_io.RoomOptions(
+            audio_input=False,
+            close_on_disconnect=False,
+        ),
+    )
     session.say(GREETING, allow_interruptions=True)
 
 

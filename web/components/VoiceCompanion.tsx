@@ -53,11 +53,27 @@ function hasAgentParticipant(room: Room): boolean {
   return false;
 }
 
+function getHumanParticipantsList(room: Room, localName: string): string[] {
+  const names: string[] = [localName || "Tú"];
+  for (const participant of room.remoteParticipants.values()) {
+    if (participant.kind !== ParticipantKind.AGENT) {
+      names.push(participant.name || participant.identity);
+    }
+  }
+  return names;
+}
+
 export function VoiceCompanion() {
   const [status, setStatus] = useState<Status>("idle");
   const [muted, setMuted] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [needsAudioTap, setNeedsAudioTap] = useState(false);
+
+  const [userName, setUserName] = useState("");
+  const [roomInput, setRoomInput] = useState("");
+  const [activeRoomCode, setActiveRoomCode] = useState<string | null>(null);
+  const [participants, setParticipants] = useState<string[]>([]);
+  const [copiedLink, setCopiedLink] = useState(false);
 
   const roomRef = useRef<Room | null>(null);
   const mutedRef = useRef(false);
@@ -72,6 +88,19 @@ export function VoiceCompanion() {
     earconsRef.current = new Earcons();
   }
 
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const savedName = window.localStorage.getItem("companionUserName") ?? "";
+    if (savedName) {
+      setUserName(savedName);
+    }
+    const params = new URLSearchParams(window.location.search);
+    const salaParam = params.get("sala")?.trim() ?? "";
+    if (salaParam) {
+      setRoomInput(salaParam);
+    }
+  }, []);
+
   const cleanup = useCallback((playTone = true) => {
     keepAliveRef.current?.stop();
     clearMediaSession();
@@ -84,6 +113,9 @@ export function VoiceCompanion() {
     mutedRef.current = false;
     setMuted(false);
     setNeedsAudioTap(false);
+    setActiveRoomCode(null);
+    setParticipants([]);
+    setCopiedLink(false);
     setStatus("idle");
 
     if (playTone) {
@@ -119,7 +151,6 @@ export function VoiceCompanion() {
       }
 
       updateMediaSession(next);
-      // Algunos navegadores pausan la pista auxiliar al pulsar play/pausa en los audífonos
       keepAliveRef.current?.ensurePlaying();
     } catch {
       setErrorMsg("No se pudo cambiar el estado del micrófono");
@@ -141,38 +172,53 @@ export function VoiceCompanion() {
     }
   }, [cleanup]);
 
-  const fetchToken = useCallback(async () => {
-    const storedCode = window.localStorage.getItem("accessCode") ?? undefined;
-    const requestToken = (accessCode?: string) =>
-      fetch("/api/livekit-token", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(accessCode ? { accessCode } : {}),
-      });
+  const fetchToken = useCallback(
+    async (trimmedName: string, trimmedRoom: string) => {
+      const storedCode =
+        window.localStorage.getItem("accessCode") ?? undefined;
+      const requestToken = (accessCode?: string) =>
+        fetch("/api/livekit-token", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            ...(accessCode ? { accessCode } : {}),
+            ...(trimmedName ? { userName: trimmedName } : {}),
+            ...(trimmedRoom ? { roomName: trimmedRoom } : {}),
+          }),
+        });
 
-    let res = await requestToken(storedCode);
+      let res = await requestToken(storedCode);
 
-    if (res.status === 401) {
-      const prompted = window.prompt("Código de acceso");
-      if (!prompted) {
-        throw new Error("Código de acceso requerido");
+      if (res.status === 401) {
+        const prompted = window.prompt("Código de acceso");
+        if (!prompted) {
+          throw new Error("Código de acceso requerido");
+        }
+        window.localStorage.setItem("accessCode", prompted);
+        res = await requestToken(prompted);
       }
-      window.localStorage.setItem("accessCode", prompted);
-      res = await requestToken(prompted);
-    }
 
-    const data = (await res.json()) as {
-      serverUrl?: string;
-      token?: string;
-      error?: string;
-    };
+      const data = (await res.json()) as {
+        serverUrl?: string;
+        token?: string;
+        sharedCode?: string;
+        userName?: string;
+        error?: string;
+      };
 
-    if (!res.ok || !data.serverUrl || !data.token) {
-      throw new Error(data.error ?? "No se pudo obtener el token de sala");
-    }
+      if (!res.ok || !data.serverUrl || !data.token) {
+        throw new Error(data.error ?? "No se pudo obtener el token de sala");
+      }
 
-    return { serverUrl: data.serverUrl, token: data.token };
-  }, []);
+      return {
+        serverUrl: data.serverUrl,
+        token: data.token,
+        sharedCode: data.sharedCode ?? trimmedRoom,
+        resolvedName: data.userName ?? (trimmedName || "Tú"),
+      };
+    },
+    [],
+  );
 
   const connect = useCallback(async () => {
     if (roomRef.current || status === "connecting") return;
@@ -182,13 +228,22 @@ export function VoiceCompanion() {
     keepAliveRef.current?.start();
     earconsRef.current?.unlock();
 
+    const trimmedName = userName.trim();
+    const trimmedRoom = roomInput.trim();
+    if (trimmedName) {
+      window.localStorage.setItem("companionUserName", trimmedName);
+    }
+
     setErrorMsg(null);
     setNeedsAudioTap(false);
     setStatus("connecting");
 
     let room: Room | null = null;
     try {
-      const { serverUrl, token } = await fetchToken();
+      const { serverUrl, token, sharedCode, resolvedName } = await fetchToken(
+        trimmedName,
+        trimmedRoom,
+      );
 
       room = new Room({
         adaptiveStream: false,
@@ -202,6 +257,11 @@ export function VoiceCompanion() {
         },
       });
       roomRef.current = room;
+
+      const syncParticipants = () => {
+        if (!room) return;
+        setParticipants(getHumanParticipantsList(room, resolvedName));
+      };
 
       const mapAgentState = (participant: RemoteParticipant) => {
         if (participant.kind !== ParticipantKind.AGENT) return;
@@ -230,12 +290,16 @@ export function VoiceCompanion() {
         if (participant.kind === ParticipantKind.AGENT) {
           setStatus("listening");
           earconsRef.current?.agentJoined();
+        } else {
+          syncParticipants();
         }
       });
 
       room.on(RoomEvent.ParticipantDisconnected, (participant) => {
         if (participant.kind === ParticipantKind.AGENT) {
           setStatus("waiting");
+        } else {
+          syncParticipants();
         }
       });
 
@@ -251,6 +315,7 @@ export function VoiceCompanion() {
 
       room.on(RoomEvent.Reconnected, () => {
         if (room) {
+          syncParticipants();
           setStatus(hasAgentParticipant(room) ? "listening" : "waiting");
         }
       });
@@ -282,6 +347,9 @@ export function VoiceCompanion() {
       await room.startAudio();
       setNeedsAudioTap(!room.canPlaybackAudio);
 
+      setActiveRoomCode(sharedCode || null);
+      syncParticipants();
+
       setupMediaSession({
         onToggleMute: () => {
           void toggleMute();
@@ -303,7 +371,33 @@ export function VoiceCompanion() {
       setErrorMsg(message);
       setStatus("error");
     }
-  }, [cleanup, fetchToken, hangup, status, toggleMute]);
+  }, [cleanup, fetchToken, hangup, roomInput, status, toggleMute, userName]);
+
+  const handleShareRoom = useCallback(async () => {
+    if (!activeRoomCode || typeof window === "undefined") return;
+    const shareUrl = `${window.location.origin}/?sala=${encodeURIComponent(activeRoomCode)}`;
+
+    try {
+      if (navigator.share) {
+        await navigator.share({
+          title: "Compañero de Voz — Sala compartida",
+          text: `Únete a nuestra conversación con el compañero de voz (sala: ${activeRoomCode})`,
+          url: shareUrl,
+        });
+        return;
+      }
+    } catch {
+      // Si el usuario cancela el sheet nativo o falla, copiamos al portapapeles
+    }
+
+    try {
+      await navigator.clipboard.writeText(shareUrl);
+      setCopiedLink(true);
+      window.setTimeout(() => setCopiedLink(false), 2500);
+    } catch {
+      window.prompt("Copia este enlace para invitar a más personas:", shareUrl);
+    }
+  }, [activeRoomCode]);
 
   useEffect(() => {
     const handleVisibilityChange = () => {
@@ -405,14 +499,60 @@ export function VoiceCompanion() {
           <span>{statusText}</span>
         </div>
 
+        {!isConnected && !isConnecting && (
+          <div className="room-form">
+            <input
+              type="text"
+              className="room-input"
+              placeholder="Tu nombre (opcional, ej. Carlos)"
+              value={userName}
+              maxLength={32}
+              onChange={(e) => setUserName(e.target.value)}
+              aria-label="Tu nombre"
+            />
+            <input
+              type="text"
+              className="room-input"
+              placeholder="Sala compartida (vacío = individual)"
+              value={roomInput}
+              maxLength={40}
+              onChange={(e) => setRoomInput(e.target.value)}
+              aria-label="Código de sala compartida"
+            />
+          </div>
+        )}
+
         {isConnected && (
-          <button
-            type="button"
-            className="mute-button"
-            onClick={() => void toggleMute()}
-          >
-            {muted ? "Activar micrófono" : "Silenciar micrófono"}
-          </button>
+          <div className="connected-controls">
+            <div className="room-badge">
+              <span>
+                Sala <strong>{activeRoomCode}</strong> ·{" "}
+                {participants.length}{" "}
+                {participants.length === 1 ? "persona" : "personas"} (
+                {participants.join(", ")})
+              </span>
+            </div>
+
+            <div className="action-row">
+              <button
+                type="button"
+                className="mute-button"
+                onClick={() => void toggleMute()}
+              >
+                {muted ? "Activar micrófono" : "Silenciar micrófono"}
+              </button>
+
+              {activeRoomCode && (
+                <button
+                  type="button"
+                  className="share-button"
+                  onClick={() => void handleShareRoom()}
+                >
+                  {copiedLink ? "¡Enlace copiado!" : "Invitar a la sala"}
+                </button>
+              )}
+            </div>
+          </div>
         )}
 
         {errorMsg && (
@@ -424,7 +564,7 @@ export function VoiceCompanion() {
 
       <footer className="hint-footer">
         Puedes apagar la pantalla. Play/pausa de tus audífonos = silenciar/activar
-        micrófono.
+        micrófono. Comparte el mismo código de sala para hablar en grupo.
       </footer>
     </main>
   );
