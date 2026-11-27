@@ -134,3 +134,41 @@ def test_sanitize_chat_context_elimina_stubs_y_fusiona_turnos_usuario():
     assert texts[1] == "Hola. ¿Cómo te llamas? Respóndeme por favor."
 
 
+def test_fs_gateway_intent_and_crud(tmp_path):
+    from fs_gateway import execute_fs_action, is_file_action_request
+
+    assert is_file_action_request("Hola, ¿cómo estás hoy?") is False
+    assert is_file_action_request("Créame un archivo notas.txt que diga hola") is True
+    assert is_file_action_request("Lista los archivos del proyecto") is True
+
+    r_create = execute_fs_action(
+        "crear",
+        ruta="prueba/notas.txt",
+        contenido="Linea 1\nLinea 2\nLinea 3",
+        base_dir=tmp_path,
+    )
+    assert r_create["ok"] is True
+
+    r_read = execute_fs_action("leer", ruta="prueba/notas.txt", base_dir=tmp_path)
+    assert r_read["ok"] is True
+    assert "2 | Linea 2" in r_read["datos"]["contenido_lineas"]
+
+    r_patch = execute_fs_action(
+        "parchear",
+        ruta="prueba/notas.txt",
+        linea_inicio=2,
+        linea_fin=2,
+        nuevo_codigo="Linea 2 editada",
+        base_dir=tmp_path,
+    )
+    assert r_patch["ok"] is True
+
+    r_search = execute_fs_action("buscar", texto="editada", base_dir=tmp_path)
+    assert r_search["ok"] is True
+    assert r_search["datos"]["total_hallados"] == 1
+
+    r_del = execute_fs_action("eliminar", ruta="prueba/notas.txt", base_dir=tmp_path)
+    assert r_del["ok"] is True
+
+
+

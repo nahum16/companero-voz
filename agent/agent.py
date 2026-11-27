@@ -1,5 +1,6 @@
 import asyncio
 import itertools
+import json
 import logging
 import os
 import re
@@ -17,6 +18,7 @@ from livekit.agents import (
     ModelSettings,
     StopResponse,
     cli,
+    function_tool,
     llm,
     room_io,
     tokenize,
@@ -25,6 +27,7 @@ from livekit.agents import (
 from livekit.plugins import groq, silero
 
 from edge_tts_plugin import EdgeTTS, detect_accent_change_request
+from fs_gateway import execute_fs_action, is_file_action_request
 from multi_audio_input import MultiParticipantAudioInput
 from prompts import GREETING, SYSTEM_PROMPT
 from text_utils import speech_text_filter
@@ -57,6 +60,11 @@ def _extract_chunk_text(chunk: Any) -> str:
     return ""
 
 
+def _chunk_has_tool_call(chunk: Any) -> bool:
+    delta = getattr(chunk, "delta", None)
+    return bool(delta is not None and getattr(delta, "tool_calls", None))
+
+
 def is_stub_assistant_text(text: str) -> bool:
     """Detecta respuestas truncadas por interrupción temprana ('M', 'J', 'De', 'Ay,', 'Uf, por')."""
     cleaned = text.strip()
@@ -75,17 +83,35 @@ def sanitize_chat_context(chat_ctx: llm.ChatContext, max_turns: int = MAX_TURNS)
     Limpia el historial antes de enviarlo al LLM:
     1. Elimina fragmentos de 1 letra o frases truncadas del asistente ('M', 'J', 'Ay,', 'Uf, por')
        que envenenan el contexto few-shot de Qwen.
-    2. Fusiona mensajes consecutivos de rol 'user' en un solo turno para mantener la
+    2. Convierte salidas de herramientas (FunctionCallOutput de api.php) en notas de texto plano
+       dentro del turno del usuario para evitar bucles de tool_call en Groq.
+    3. Fusiona mensajes consecutivos de rol 'user' en un solo turno para mantener la
        alternancia estricta user <-> assistant que exige la plantilla ChatML.
     """
     raw_copy = chat_ctx.copy(
-        exclude_function_call=True,
         exclude_handoff=True,
         exclude_config_update=True,
     )
 
     cleaned_items: list[Any] = []
     for item in raw_copy.items:
+        if isinstance(item, llm.FunctionCall):
+            continue
+
+        if isinstance(item, llm.FunctionCallOutput):
+            note = f"\n[Resultado ejecutado en api.php ({item.name}): {item.output}]"
+            if (
+                cleaned_items
+                and isinstance(cleaned_items[-1], llm.ChatMessage)
+                and cleaned_items[-1].role == "user"
+            ):
+                prev_msg = cleaned_items[-1]
+                prev_text = (prev_msg.text_content or "").strip()
+                cleaned_items[-1] = prev_msg.model_copy(update={"content": [f"{prev_text}{note}"]})
+            else:
+                cleaned_items.append(llm.ChatMessage(role="user", content=[note.strip()]))
+            continue
+
         if not isinstance(item, llm.ChatMessage):
             cleaned_items.append(item)
             continue
@@ -208,18 +234,69 @@ class Companion(Agent):
                 self._edge_tts.set_voice(new_voice)
                 logger.info("Voz cambiada en vivo a %s (%s)", new_voice, label)
 
+    @function_tool(
+        name="gestionar_archivos",
+        description=(
+            "Ejecuta acciones reales sobre los archivos y carpetas del proyecto usando api.php: "
+            "accion puede ser 'listar', 'arbol', 'leer', 'crear', 'escribir', 'parchear', "
+            "'buscar', 'copiar', 'mover', 'eliminar' o 'info'."
+        ),
+    )
+    async def gestionar_archivos(
+        self,
+        accion: str,
+        ruta: str = "",
+        contenido: str = "",
+        tipo: str = "archivo",
+        texto: str = "",
+        extension: str = "",
+        origen: str = "",
+        destino: str = "",
+        linea_inicio: int = 0,
+        linea_fin: int = 0,
+        nuevo_codigo: str = "",
+    ) -> str:
+        logger.info("Ejecutando api.php -> accion=%s ruta=%r", accion, ruta or origen)
+        result = await asyncio.to_thread(
+            execute_fs_action,
+            accion,
+            ruta=ruta,
+            contenido=contenido,
+            tipo=tipo,
+            texto=texto,
+            extension=extension,
+            origen=origen,
+            destino=destino,
+            linea_inicio=linea_inicio,
+            linea_fin=linea_fin,
+            nuevo_codigo=nuevo_codigo,
+        )
+        return json.dumps(result, ensure_ascii=False)
+
     async def llm_node(
         self,
         chat_ctx: llm.ChatContext,
         tools: list[llm.Tool],
         model_settings: ModelSettings,
     ) -> AsyncIterable[llm.ChatChunk | str | Any]:
+        has_trailing_tool_output = bool(
+            chat_ctx.items and isinstance(chat_ctx.items[-1], llm.FunctionCallOutput)
+        )
+
+        raw_last_user_text = ""
+        for item in reversed(chat_ctx.items):
+            if isinstance(item, llm.ChatMessage) and item.role == "user":
+                raw_last_user_text = (item.text_content or "").strip()
+                break
+
+        enable_fs_tool = (not has_trailing_tool_output) and is_file_action_request(raw_last_user_text)
+        active_tools = tools if enable_fs_tool else []
+
         speaker = self._multi_input.last_active_speaker if self._multi_input else None
         humans = _human_participants(self._room) if self._room else []
         should_tag = bool(speaker) and (len(humans) > 1 or speaker != "Usuario")
 
         working_ctx = chat_ctx.copy(
-            exclude_function_call=True,
             exclude_handoff=True,
             exclude_config_update=True,
         )
@@ -242,7 +319,7 @@ class Companion(Agent):
         trimmed = sanitize_chat_context(working_ctx, max_turns=MAX_TURNS)
 
         if not GROQ_KEYS:
-            async for chunk in Agent.default.llm_node(self, trimmed, tools, model_settings):
+            async for chunk in Agent.default.llm_node(self, trimmed, active_tools, model_settings):
                 yield chunk
             return
 
@@ -266,17 +343,21 @@ class Companion(Agent):
                 accumulated_text = ""
                 try:
                     llm_instance = build_groq_llm(api_key, model_name)
-                    tool_choice = model_settings.tool_choice if model_settings else None
+                    tool_choice = (
+                        model_settings.tool_choice
+                        if (model_settings and active_tools)
+                        else None
+                    )
                     async with llm_instance.chat(
                         chat_ctx=trimmed,
-                        tools=tools,
+                        tools=active_tools,
                         tool_choice=tool_choice,
                     ) as stream:
                         async for chunk in stream:
                             if not flushed_to_caller:
                                 initial_chunks.append(chunk)
                                 accumulated_text += _extract_chunk_text(chunk)
-                                if len(accumulated_text.strip()) >= 4:
+                                if len(accumulated_text.strip()) >= 4 or _chunk_has_tool_call(chunk):
                                     flushed_to_caller = True
                                     for pending in initial_chunks:
                                         yield pending
